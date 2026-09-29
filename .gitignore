@@ -1,0 +1,39 @@
+# Team and member records must stay local and must never enter repository history.
+/archive/
+/notices/
+/data/seed.sqlite3
+/data/migration/legacy-manifest.json
+**/legacy_assets/
+/data/transfer-inbox/
+
+# Locally downloaded dependencies and generated release artifacts.
+/.deps/
+/dist/
+/build/
+/ui/
+/static_host.py
+/build_windows.ps1
+/LionManager.spec
+**/node_modules/
+**/.dart_tool/
+**/.pub-cache/
+**/.pub/
+**/.gradle/
+**/build/
+**/ephemeral/
+**/.symlinks/
+**/Flutter/Generated.xcconfig
+**/Flutter/flutter_export_environment.sh
+**/flutter_export_environment.sh
+**/.flutter-plugins-dependencies
+**/local.properties
+/native_app/assets/seed.sqlite3
+/native_app/assets/media/
+
+# Local database files must never be added to the repository.
+*.sqlite3
+*.sqlite
+*.db
+
+# Legacy browser documentation retained locally during the native app transition.
+/README.pwa-legacy.md
