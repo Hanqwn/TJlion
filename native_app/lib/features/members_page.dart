@@ -1,12 +1,20 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
 
 import '../data/lion_repository.dart';
 import '../data/models.dart';
+import '../services/excel_import_service.dart';
 
 class MembersPage extends StatefulWidget {
-  const MembersPage({super.key, required this.repository});
+  const MembersPage({
+    super.key,
+    required this.repository,
+    this.onCurrentSemesterChanged,
+  });
 
   final LionRepository repository;
+  final VoidCallback? onCurrentSemesterChanged;
 
   @override
   State<MembersPage> createState() => _MembersPageState();
@@ -57,6 +65,28 @@ class _MembersPageState extends State<MembersPage> {
     });
   }
 
+  Semester? get _selectedSemester {
+    final id = _semesterId;
+    if (id == null) return null;
+    for (final semester in _semesters) {
+      if (semester.id == id) return semester;
+    }
+    return null;
+  }
+
+  void _setSelectedSemesterAsCurrent() {
+    final semester = _selectedSemester;
+    if (semester == null || semester.isCurrent) return;
+    try {
+      widget.repository.setCurrentSemester(semester.id);
+      _reloadSemesters(preferredSemesterId: semester.id);
+      widget.onCurrentSemesterChanged?.call();
+      _showMessage('已将“${semester.label}”设为全局当前学期。');
+    } catch (error) {
+      _showMessage('设置失败：$error');
+    }
+  }
+
   List<Member> get _visibleMembers {
     if (_query.isEmpty) return _members;
     final query = _query.toLowerCase();
@@ -76,13 +106,17 @@ class _MembersPageState extends State<MembersPage> {
     if (semesterId == null) return;
     final result = await showDialog<_MemberDraft>(
       context: context,
-      builder: (context) => _MemberEditorDialog(member: member),
+      builder: (context) => _MemberEditorDialog(
+        member: member,
+        people: widget.repository.getPeople(),
+      ),
     );
     if (result == null || !mounted) return;
     try {
       if (member == null) {
         widget.repository.addMember(
           semesterId: semesterId,
+          personId: result.personId,
           name: result.name,
           studentNo: result.studentNo,
           grade: result.grade,
@@ -96,6 +130,7 @@ class _MembersPageState extends State<MembersPage> {
         widget.repository.updateMember(
           Member(
             id: member.id,
+            personId: result.personId ?? member.personId,
             semesterId: semesterId,
             studentNo: result.studentNo,
             name: result.name,
@@ -155,8 +190,201 @@ class _MembersPageState extends State<MembersPage> {
     }
   }
 
+  Future<void> _downloadMemberTemplate() async {
+    try {
+      final data = await rootBundle.load(
+        'assets/templates/member_roster_template.xlsx',
+      );
+      final bytes = data.buffer.asUint8List(
+        data.offsetInBytes,
+        data.lengthInBytes,
+      );
+      final saved = await FilePicker.saveFile(
+        fileName: '成员名册.xlsx',
+        bytes: bytes,
+        mimeType:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        dialogTitle: '保存成员名册模板',
+        type: FileType.custom,
+        allowedExtensions: const ['xlsx'],
+      );
+      if (saved != null && mounted) {
+        _showMessage('模板已保存到所选位置。');
+      }
+    } catch (error) {
+      if (mounted) _showMessage('导出模板失败：$error');
+    }
+  }
+
+  Future<void> _importRoster() async {
+    final semesterId = _semesterId;
+    if (semesterId == null) return;
+    try {
+      final picked = await FilePicker.pickFile(
+        dialogTitle: '选择成员名册 XLSX',
+        type: FileType.custom,
+        allowedExtensions: const ['xlsx'],
+      );
+      if (picked == null || !mounted) return;
+      final bytes = await picked.readAsBytes();
+      final result = const ExcelImportService().parseMembers(bytes);
+      final semester = _semesters.firstWhere((item) => item.id == semesterId);
+      final entries = _makeImportPreviewRows(
+        result,
+        widget.repository.getMembers(semesterId),
+      );
+      final confirmedRows = await showDialog<List<_MemberImportPreviewRow>>(
+        context: context,
+        builder: (context) => _MemberImportPreviewDialog(
+          result: result,
+          semesterLabel: semester.label,
+          rows: entries,
+        ),
+      );
+      if (confirmedRows == null || !mounted) return;
+      _commitRosterImport(semesterId, confirmedRows);
+    } catch (error) {
+      if (mounted) _showMessage('导入成员名册失败：$error');
+    }
+  }
+
+  List<_MemberImportPreviewRow> _makeImportPreviewRows(
+    ExcelImportResult result,
+    List<Member> existingMembers,
+  ) {
+    final seenWorkbookKeys = <String>{};
+    return result.rows
+        .map((row) {
+          final fields = row.fields;
+          final name = (fields['姓名'] ?? '').trim();
+          final studentNo = _importField(row, '学号', preserveRaw: true).trim();
+          if (name.isEmpty) {
+            return _MemberImportPreviewRow(
+              row: row,
+              blockedReason: '姓名为空，无法导入。',
+            );
+          }
+
+          final studentKey = _normalizeStudentNo(studentNo);
+          final workbookKey = studentKey.isNotEmpty
+              ? 'id:$studentKey'
+              : 'name:${name.toLowerCase()}';
+          if (!seenWorkbookKeys.add(workbookKey)) {
+            return _MemberImportPreviewRow(
+              row: row,
+              blockedReason: studentKey.isNotEmpty
+                  ? '文件内学号重复，已保留首次出现的记录。'
+                  : '文件内姓名重复且无学号，已保留首次出现的记录。',
+            );
+          }
+
+          final matches = existingMembers
+              .where((member) {
+                if (studentKey.isNotEmpty) {
+                  return _normalizeStudentNo(member.studentNo) == studentKey;
+                }
+                return member.studentNo.trim().isEmpty &&
+                    member.name.trim().toLowerCase() == name.toLowerCase();
+              })
+              .toList(growable: false);
+          if (matches.length > 1) {
+            return _MemberImportPreviewRow(
+              row: row,
+              blockedReason: '当前学期有多位成员匹配，需先手动整理名册。',
+            );
+          }
+          if (matches.length == 1) {
+            return _MemberImportPreviewRow(
+              row: row,
+              existingMember: matches.single,
+              choice: _MemberImportChoice.skip,
+            );
+          }
+          return _MemberImportPreviewRow(row: row);
+        })
+        .toList(growable: false);
+  }
+
+  String _normalizeStudentNo(String value) =>
+      value.trim().replaceAll(RegExp(r'\s+'), '').toUpperCase();
+
+  void _commitRosterImport(int semesterId, List<_MemberImportPreviewRow> rows) {
+    var added = 0;
+    var updated = 0;
+    var skipped = 0;
+    var failed = 0;
+    for (final entry in rows) {
+      final fields = entry.row.fields;
+      try {
+        switch (entry.choice) {
+          case _MemberImportChoice.add:
+            widget.repository.addMember(
+              semesterId: semesterId,
+              name: (fields['姓名'] ?? '').trim(),
+              studentNo: _importField(entry.row, '学号', preserveRaw: true),
+              grade: (fields['年级'] ?? '').trim(),
+              major: (fields['专业'] ?? '').trim(),
+              birthday: _importField(entry.row, '生日'),
+              contact: _importField(entry.row, '联系方式', preserveRaw: true),
+              position: (fields['职位'] ?? '').trim(),
+            );
+            added++;
+            break;
+          case _MemberImportChoice.update:
+            final existing = entry.existingMember;
+            if (existing == null) {
+              skipped++;
+              continue;
+            }
+            widget.repository.updateMember(
+              Member(
+                id: existing.id,
+                personId: existing.personId,
+                semesterId: semesterId,
+                studentNo: _importField(entry.row, '学号', preserveRaw: true),
+                name: (fields['姓名'] ?? '').trim(),
+                grade: (fields['年级'] ?? '').trim(),
+                major: (fields['专业'] ?? '').trim(),
+                position: (fields['职位'] ?? '').trim(),
+                birthday: _importField(entry.row, '生日'),
+                contact: _importField(entry.row, '联系方式', preserveRaw: true),
+                notes: existing.notes,
+                active: existing.active,
+              ),
+            );
+            updated++;
+            break;
+          case _MemberImportChoice.skip:
+            skipped++;
+            break;
+        }
+      } catch (_) {
+        failed++;
+      }
+    }
+    if (_semesterId == semesterId) _reloadMembers();
+    _showMessage('导入完成：新增 $added，更新 $updated，跳过 $skipped，失败 $failed。');
+  }
+
+  String _importField(
+    ExcelImportRow row,
+    String field, {
+    bool preserveRaw = false,
+  }) {
+    if (field == '生日' && row.numericFields.containsKey(field)) {
+      return row.fields[field] ?? row.rawFields[field] ?? '';
+    }
+    if (preserveRaw) return row.rawFields[field] ?? row.fields[field] ?? '';
+    return row.fields[field] ?? row.rawFields[field] ?? '';
+  }
+
   Future<void> _showMemberCard(Member member) async {
     final history = widget.repository.getMemberSemesterHistory(member);
+    final person = widget.repository.getPerson(member.personId);
+    if (person == null) {
+      _showMessage('找不到这位成员的长期档案，请检查数据库记录。');
+      return;
+    }
     final activities = widget.repository.getEventsForMemberIds(
       history.map((item) => item.id),
     );
@@ -164,6 +392,7 @@ class _MembersPageState extends State<MembersPage> {
     await showDialog<void>(
       context: context,
       builder: (context) => _MemberProfileDialog(
+        person: person,
         member: member,
         semesterHistory: history,
         semesters: _semesters,
@@ -172,12 +401,14 @@ class _MembersPageState extends State<MembersPage> {
     );
   }
 
-  Future<void> _deleteMember(Member member) async {
+  Future<void> _deactivateMember(Member member) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('删除成员？'),
-        content: Text('确定删除“${member.name}”吗？关联的出勤记录也会一并删除。'),
+        title: const Text('从本学期名册停用？'),
+        content: Text(
+          '确定将“${member.name}”从本学期在册名单停用吗？长期个人档案、考勤和活动记录都会保留，可在编辑时重新启用。',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -185,18 +416,18 @@ class _MembersPageState extends State<MembersPage> {
           ),
           FilledButton.tonal(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('删除'),
+            child: const Text('停用'),
           ),
         ],
       ),
     );
     if (confirmed != true || !mounted) return;
     try {
-      widget.repository.deleteMember(member.id);
+      widget.repository.deactivateMember(member.id);
       _reloadMembers();
-      _showMessage('成员已删除');
+      _showMessage('成员已从本学期在册名册停用，历史记录保留');
     } catch (error) {
-      _showMessage('删除失败：$error');
+      _showMessage('停用失败：$error');
     }
   }
 
@@ -210,6 +441,8 @@ class _MembersPageState extends State<MembersPage> {
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     final activeCount = _members.where((member) => member.active).length;
+    final globalCurrentSemester = widget.repository.getCurrentSemester();
+    final selectedSemester = _selectedSemester;
     return Scaffold(
       body: SafeArea(
         child: Center(
@@ -246,7 +479,7 @@ class _MembersPageState extends State<MembersPage> {
                             ),
                             const SizedBox(height: 3),
                             Text(
-                              '按学期管理成员资料与在册状态',
+                              '名册按学期显示；同一成员的历年信息汇总在一张长期个人名片中',
                               style: Theme.of(context).textTheme.bodyMedium
                                   ?.copyWith(color: colors.onSurfaceVariant),
                             ),
@@ -295,7 +528,7 @@ class _MembersPageState extends State<MembersPage> {
                             value: _semesterId,
                             isExpanded: true,
                             decoration: const InputDecoration(
-                              labelText: '当前学期',
+                              labelText: '查看名册学期',
                               border: OutlineInputBorder(),
                               prefixIcon: Icon(Icons.calendar_month_outlined),
                             ),
@@ -321,7 +554,7 @@ class _MembersPageState extends State<MembersPage> {
                           final search = TextField(
                             controller: _searchController,
                             decoration: InputDecoration(
-                              hintText: '搜索姓名、学号、年级或专业',
+                              hintText: '搜索姓名、学号、年级、专业或职位',
                               prefixIcon: const Icon(Icons.search),
                               suffixIcon: _query.isEmpty
                                   ? null
@@ -337,6 +570,36 @@ class _MembersPageState extends State<MembersPage> {
                             spacing: 8,
                             runSpacing: 8,
                             children: [
+                              Chip(
+                                avatar: const Icon(
+                                  Icons.flag_outlined,
+                                  size: 18,
+                                ),
+                                label: Text(
+                                  '全局当前：${globalCurrentSemester?.label ?? '未设置'}',
+                                ),
+                              ),
+                              FilledButton.tonalIcon(
+                                onPressed:
+                                    selectedSemester == null ||
+                                        selectedSemester.isCurrent
+                                    ? null
+                                    : _setSelectedSemesterAsCurrent,
+                                icon: const Icon(Icons.check_circle_outline),
+                                label: const Text('设为当前学期'),
+                              ),
+                              FilledButton.icon(
+                                onPressed: _semesterId == null
+                                    ? null
+                                    : _importRoster,
+                                icon: const Icon(Icons.upload_file_outlined),
+                                label: const Text('导入 XLSX'),
+                              ),
+                              OutlinedButton.icon(
+                                onPressed: _downloadMemberTemplate,
+                                icon: const Icon(Icons.download_outlined),
+                                label: const Text('下载成员模板'),
+                              ),
                               OutlinedButton.icon(
                                 onPressed: _semesters.length < 2
                                     ? null
@@ -367,12 +630,17 @@ class _MembersPageState extends State<MembersPage> {
                               ],
                             );
                           }
-                          return Row(
+                          return Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
-                              SizedBox(width: 250, child: selector),
-                              const SizedBox(width: 12),
-                              Expanded(child: search),
-                              const SizedBox(width: 12),
+                              Row(
+                                children: [
+                                  SizedBox(width: 250, child: selector),
+                                  const SizedBox(width: 12),
+                                  Expanded(child: search),
+                                ],
+                              ),
+                              const SizedBox(height: 12),
                               actions,
                             ],
                           );
@@ -472,9 +740,9 @@ class _MembersPageState extends State<MembersPage> {
                   icon: const Icon(Icons.edit_outlined),
                 ),
                 IconButton(
-                  onPressed: () => _deleteMember(member),
-                  tooltip: '删除成员',
-                  icon: Icon(Icons.delete_outline, color: colors.error),
+                  onPressed: () => _deactivateMember(member),
+                  tooltip: '从本学期名册停用',
+                  icon: Icon(Icons.person_off_outlined, color: colors.error),
                 ),
               ],
             ),
@@ -485,8 +753,297 @@ class _MembersPageState extends State<MembersPage> {
   }
 }
 
+enum _MemberImportChoice { add, update, skip }
+
+class _MemberImportPreviewRow {
+  _MemberImportPreviewRow({
+    required this.row,
+    this.existingMember,
+    this.blockedReason,
+    _MemberImportChoice? choice,
+  }) : choice = blockedReason != null
+           ? _MemberImportChoice.skip
+           : choice ?? _MemberImportChoice.add;
+
+  final ExcelImportRow row;
+  final Member? existingMember;
+  final String? blockedReason;
+  _MemberImportChoice choice;
+}
+
+class _MemberImportPreviewDialog extends StatefulWidget {
+  const _MemberImportPreviewDialog({
+    required this.result,
+    required this.semesterLabel,
+    required this.rows,
+  });
+
+  final ExcelImportResult result;
+  final String semesterLabel;
+  final List<_MemberImportPreviewRow> rows;
+
+  @override
+  State<_MemberImportPreviewDialog> createState() =>
+      _MemberImportPreviewDialogState();
+}
+
+class _MemberImportPreviewDialogState
+    extends State<_MemberImportPreviewDialog> {
+  int get _addCount => widget.rows
+      .where(
+        (entry) =>
+            entry.blockedReason == null &&
+            entry.existingMember == null &&
+            entry.choice == _MemberImportChoice.add,
+      )
+      .length;
+
+  int get _updateCount => widget.rows
+      .where(
+        (entry) =>
+            entry.blockedReason == null &&
+            entry.existingMember != null &&
+            entry.choice == _MemberImportChoice.update,
+      )
+      .length;
+
+  int get _duplicateCount =>
+      widget.rows.where((entry) => entry.existingMember != null).length;
+
+  int get _skipCount => widget.rows.length - _addCount - _updateCount;
+
+  bool get _canImport =>
+      !widget.result.hasErrors && _addCount + _updateCount > 0;
+
+  String _field(ExcelImportRow row, String label, {bool preserveRaw = false}) {
+    final fields = preserveRaw ? row.rawFields : row.fields;
+    return fields[label] ?? row.fields[label] ?? '';
+  }
+
+  String _choiceLabel(_MemberImportChoice choice) => switch (choice) {
+    _MemberImportChoice.add => '新增',
+    _MemberImportChoice.update => '更新已有成员',
+    _MemberImportChoice.skip => '跳过',
+  };
+
+  Color _choiceColor(ColorScheme colors, _MemberImportChoice choice) =>
+      switch (choice) {
+        _MemberImportChoice.add => colors.tertiaryContainer,
+        _MemberImportChoice.update => colors.primaryContainer,
+        _MemberImportChoice.skip => colors.surfaceContainerHighest,
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final warnings = widget.result.diagnostics
+        .where(
+          (diagnostic) =>
+              diagnostic.severity == ExcelImportDiagnosticSeverity.warning,
+        )
+        .toList(growable: false);
+    return AlertDialog(
+      title: const Text('导入成员名册预览'),
+      content: SizedBox(
+        width: 880,
+        height: MediaQuery.sizeOf(context).height * 0.68,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              '目标学期：${widget.semesterLabel} · 工作表：${widget.result.sheetName}',
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '读取学号、生日和联系方式的单元格内容，不读取字体加粗等格式。'
+              '学号和联系方式按原文读取；数值日期会转换成日期文本。',
+              style: Theme.of(context).textTheme.bodySmall
+                  ?.copyWith(color: colors.onSurfaceVariant),
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: [
+                Chip(label: Text('新增 $_addCount')),
+                Chip(label: Text('已有匹配 $_duplicateCount')),
+                Chip(label: Text('更新 $_updateCount')),
+                Chip(label: Text('跳过 $_skipCount')),
+              ],
+            ),
+            if (widget.result.hasErrors)
+              Container(
+                padding: const EdgeInsets.all(12),
+                margin: const EdgeInsets.only(bottom: 8),
+                decoration: BoxDecoration(
+                  color: colors.errorContainer,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: widget.result.diagnostics
+                      .where(
+                        (diagnostic) =>
+                            diagnostic.severity ==
+                            ExcelImportDiagnosticSeverity.error,
+                      )
+                      .map((diagnostic) => Text(diagnostic.message))
+                      .toList(),
+                ),
+              )
+            else if (warnings.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  warnings
+                      .take(4)
+                      .map((diagnostic) => diagnostic.message)
+                      .join('\n'),
+                  maxLines: 4,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall
+                      ?.copyWith(color: colors.onSurfaceVariant),
+                ),
+              ),
+            Expanded(
+              child: widget.rows.isEmpty
+                  ? Center(
+                      child: Text(
+                        '工作表中没有可预览的成员行。',
+                        style: Theme.of(context).textTheme.bodyMedium
+                            ?.copyWith(color: colors.onSurfaceVariant),
+                      ),
+                    )
+                  : ListView.separated(
+                      itemCount: widget.rows.length,
+                      separatorBuilder: (context, index) =>
+                          const SizedBox(height: 8),
+                      itemBuilder: (context, index) =>
+                          _buildRowCard(context, colors, widget.rows[index]),
+                    ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton.icon(
+          onPressed: _canImport
+              ? () => Navigator.pop(context, widget.rows)
+              : null,
+          icon: const Icon(Icons.file_download_done_outlined),
+          label: Text('确认导入（新增 $_addCount · 更新 $_updateCount）'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildRowCard(
+    BuildContext context,
+    ColorScheme colors,
+    _MemberImportPreviewRow entry,
+  ) {
+    final row = entry.row;
+    final name = _field(row, '姓名').trim();
+    final studentNo = _field(row, '学号', preserveRaw: true);
+    final contact = _field(row, '联系方式', preserveRaw: true);
+    final details = [
+      '学号：${studentNo.trim().isEmpty ? '未填写' : studentNo}',
+      '年级：${_field(row, '年级').trim().ifEmpty('未填写')}',
+      '专业：${_field(row, '专业').trim().ifEmpty('未填写')}',
+      '生日：${_field(row, '生日').trim().ifEmpty('未填写')}',
+      '联系方式：${contact.trim().isEmpty ? '未填写' : contact}',
+      '职位：${_field(row, '职位').trim().ifEmpty('未填写')}',
+    ].join('\n');
+    final statusColor = entry.blockedReason != null
+        ? colors.errorContainer
+        : _choiceColor(colors, entry.choice);
+    return Card(
+      elevation: 0,
+      color: colors.surfaceContainerLow,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '第 ${row.rowNumber} 行 · ${name.isEmpty ? '（无姓名）' : name}',
+                    style: Theme.of(context).textTheme.titleSmall
+                        ?.copyWith(fontWeight: FontWeight.w700),
+                  ),
+                ),
+                if (entry.blockedReason == null)
+                  DropdownButton<_MemberImportChoice>(
+                    value: entry.choice,
+                    items:
+                        (entry.existingMember == null
+                                ? const [
+                                    _MemberImportChoice.add,
+                                    _MemberImportChoice.skip,
+                                  ]
+                                : const [
+                                    _MemberImportChoice.update,
+                                    _MemberImportChoice.skip,
+                                  ])
+                            .map(
+                              (choice) => DropdownMenuItem(
+                                value: choice,
+                                child: Text(_choiceLabel(choice)),
+                              ),
+                            )
+                            .toList(),
+                    onChanged: (choice) {
+                      if (choice == null) return;
+                      setState(() => entry.choice = choice);
+                    },
+                  )
+                else
+                  Chip(
+                    backgroundColor: statusColor,
+                    label: const Text('不可导入'),
+                    visualDensity: VisualDensity.compact,
+                  ),
+              ],
+            ),
+            if (entry.existingMember != null && entry.blockedReason == null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text(
+                  '当前学期已有：${entry.existingMember!.name} · ${entry.existingMember!.studentNo.isEmpty ? '无学号' : entry.existingMember!.studentNo}。请选择更新或跳过。',
+                  style: Theme.of(context).textTheme.bodySmall
+                      ?.copyWith(color: colors.primary),
+                ),
+              ),
+            if (entry.blockedReason != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text(
+                  entry.blockedReason!,
+                  style: Theme.of(context).textTheme.bodySmall
+                      ?.copyWith(color: colors.error),
+                ),
+              ),
+            Text(details, style: Theme.of(context).textTheme.bodySmall),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+extension on String {
+  String ifEmpty(String fallback) => isEmpty ? fallback : this;
+}
+
 class _MemberDraft {
   const _MemberDraft({
+    required this.personId,
     required this.name,
     required this.studentNo,
     required this.grade,
@@ -497,6 +1054,7 @@ class _MemberDraft {
     required this.active,
   });
 
+  final int? personId;
   final String name;
   final String studentNo;
   final String grade;
@@ -508,8 +1066,9 @@ class _MemberDraft {
 }
 
 class _MemberEditorDialog extends StatefulWidget {
-  const _MemberEditorDialog({this.member});
+  const _MemberEditorDialog({required this.people, this.member});
 
+  final List<PersonProfile> people;
   final Member? member;
 
   @override
@@ -525,12 +1084,14 @@ class _MemberEditorDialogState extends State<_MemberEditorDialog> {
   late final TextEditingController _position;
   late final TextEditingController _birthday;
   late final TextEditingController _notes;
+  late int? _personId;
   late bool _active;
 
   @override
   void initState() {
     super.initState();
     final member = widget.member;
+    _personId = member?.personId;
     _name = TextEditingController(text: member?.name ?? '');
     _studentNo = TextEditingController(text: member?.studentNo ?? '');
     _grade = TextEditingController(text: member?.grade ?? '');
@@ -576,6 +1137,7 @@ class _MemberEditorDialogState extends State<_MemberEditorDialog> {
     Navigator.pop(
       context,
       _MemberDraft(
+        personId: _personId,
         name: _name.text.trim(),
         studentNo: _studentNo.text.trim(),
         grade: _grade.text.trim(),
@@ -600,6 +1162,56 @@ class _MemberEditorDialogState extends State<_MemberEditorDialog> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                if (widget.people.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: DropdownButtonFormField<int?>(
+                      value: _personId,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: '长期个人档案',
+                        prefixIcon: Icon(Icons.folder_shared_outlined),
+                      ),
+                      items: [
+                        if (widget.member == null)
+                          const DropdownMenuItem<int?>(
+                            value: null,
+                            child: Text('新建个人档案'),
+                          ),
+                        ...widget.people.map(
+                          (person) => DropdownMenuItem<int?>(
+                            value: person.id,
+                            child: Text(
+                              '${person.displayName} · ${person.birthday.isEmpty ? '生日未填' : person.birthday} · 档案#${person.id}',
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        setState(() => _personId = value);
+                        if (value == null) return;
+                        final selected = widget.people.firstWhere(
+                          (person) => person.id == value,
+                        );
+                        _name.text = selected.displayName;
+                        _birthday.text = selected.birthday;
+                      },
+                    ),
+                  ),
+                if (widget.people.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        '同一人跨学期请选择同一个档案；学号、年级、专业和职位仍按当前学期填写。资料缺少自动匹配线索时，也可在这里手动关联。',
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                  ),
                 TextFormField(
                   controller: _name,
                   autofocus: true,
@@ -700,12 +1312,14 @@ class _MemberEditorDialogState extends State<_MemberEditorDialog> {
 
 class _MemberProfileDialog extends StatelessWidget {
   const _MemberProfileDialog({
+    required this.person,
     required this.member,
     required this.semesterHistory,
     required this.semesters,
     required this.activities,
   });
 
+  final PersonProfile person;
   final Member member;
   final List<Member> semesterHistory;
   final List<Semester> semesters;
@@ -733,16 +1347,16 @@ class _MemberProfileDialog extends StatelessWidget {
           CircleAvatar(
             backgroundColor: colors.primaryContainer,
             foregroundColor: colors.onPrimaryContainer,
-            child: Text(_memberInitial(member.name)),
+            child: Text(_memberInitial(person.displayName)),
           ),
           const SizedBox(width: 12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(member.name),
+                Text(person.displayName),
                 Text(
-                  member.active ? '在册成员名片' : '已停用成员名片',
+                  member.active ? '长期个人档案 · 本学期在册' : '长期个人档案 · 本学期已停用',
                   style: Theme.of(context).textTheme.bodySmall
                       ?.copyWith(color: colors.onSurfaceVariant),
                 ),
@@ -762,22 +1376,12 @@ class _MemberProfileDialog extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 const _ProfileSectionHeader(title: '基本信息'),
-                _ProfileInfoRow(label: '姓名', value: member.name),
-                _ProfileInfoRow(
-                  label: '学号',
-                  value: member.studentNo.trim().isEmpty
-                      ? '未填写'
-                      : member.studentNo,
-                ),
-                _ProfileInfoRow(label: '年级', value: member.grade),
-                _ProfileInfoRow(label: '专业', value: member.major),
+                _ProfileInfoRow(label: '姓名', value: person.displayName),
                 _ProfileInfoRow(
                   label: '生日',
-                  value: _dateLabel(member.birthday),
+                  value: _dateLabel(person.birthday),
                 ),
-                if (member.notes.trim().isNotEmpty)
-                  _ProfileInfoRow(label: '备注', value: member.notes),
-                const _ProfileSectionHeader(title: '各学期档案与职位'),
+                const _ProfileSectionHeader(title: '各学期信息'),
                 if (semesterHistory.isEmpty)
                   const _ProfileEmptyText(text: '没有找到其他学期的成员记录。')
                 else
@@ -819,6 +1423,14 @@ class _MemberProfileDialog extends StatelessWidget {
                               runSpacing: 6,
                               children: [
                                 _ProfileValueChip(
+                                  label: '学号',
+                                  value: record.studentNo,
+                                ),
+                                _ProfileValueChip(
+                                  label: '姓名',
+                                  value: record.name,
+                                ),
+                                _ProfileValueChip(
                                   label: '年级',
                                   value: record.grade,
                                 ),
@@ -832,6 +1444,11 @@ class _MemberProfileDialog extends StatelessWidget {
                                 ),
                               ],
                             ),
+                            if (record.notes.trim().isNotEmpty)
+                              _ProfileInfoRow(
+                                label: '当学期备注',
+                                value: record.notes,
+                              ),
                           ],
                         ),
                       ),

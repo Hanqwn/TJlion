@@ -2,11 +2,13 @@ import 'package:flutter/material.dart';
 
 import '../data/lion_repository.dart';
 import '../features/attendance_page.dart';
+import '../features/archives_page.dart';
 import '../features/dashboard_page.dart';
 import '../features/daily_training_page.dart';
 import '../features/events_page.dart';
 import '../features/finance_page.dart';
 import '../features/library_page.dart';
+import '../features/inventory_page.dart';
 import '../features/members_page.dart';
 import '../features/plans_reports_page.dart';
 import '../features/routines_page.dart';
@@ -84,6 +86,18 @@ class _AppShellState extends State<AppShell> {
       selectedIcon: Icons.folder_rounded,
     ),
     _AppDestination(
+      section: _ShellSection.archives,
+      title: '档案馆',
+      icon: Icons.archive_outlined,
+      selectedIcon: Icons.archive_rounded,
+    ),
+    _AppDestination(
+      section: _ShellSection.inventory,
+      title: '道具',
+      icon: Icons.inventory_2_outlined,
+      selectedIcon: Icons.inventory_2_rounded,
+    ),
+    _AppDestination(
       section: _ShellSection.settings,
       title: '设置',
       icon: Icons.settings_outlined,
@@ -104,6 +118,10 @@ class _AppShellState extends State<AppShell> {
     setState(() => _selectedSection = section);
   }
 
+  void _refreshCurrentSemester() {
+    if (mounted) setState(() {});
+  }
+
   Widget _buildPage() {
     final repository = widget.repository;
     return switch (_selectedSection) {
@@ -111,7 +129,10 @@ class _AppShellState extends State<AppShell> {
         repository: repository,
         onNavigate: (section) => _navigate(_shellSectionFromDashboard(section)),
       ),
-      _ShellSection.members => MembersPage(repository: repository),
+      _ShellSection.members => MembersPage(
+        repository: repository,
+        onCurrentSemesterChanged: _refreshCurrentSemester,
+      ),
       _ShellSection.attendance => AttendancePage(repository: repository),
       _ShellSection.daily => DailyTrainingPage(repository: repository),
       _ShellSection.events => EventsPage(repository: repository),
@@ -123,6 +144,11 @@ class _AppShellState extends State<AppShell> {
       _ShellSection.plans => TrainingPlansPage(repository: repository),
       _ShellSection.finance => FinancePage(repository: repository),
       _ShellSection.library => LibraryPage(repository: repository),
+      _ShellSection.archives => ArchivesPage(
+        repository: repository,
+        onNavigate: (section) => _navigate(_shellSectionFromDashboard(section)),
+      ),
+      _ShellSection.inventory => InventoryPage(repository: repository),
       _ShellSection.settings => SettingsPage(repository: repository),
     };
   }
@@ -133,6 +159,8 @@ class _AppShellState extends State<AppShell> {
     final width = MediaQuery.sizeOf(context).width;
     final isDesktop = width >= 900;
     final isExtendedRail = width >= 1320;
+    final railLabelStyle = Theme.of(context).textTheme.labelSmall
+        ?.copyWith(fontSize: 12, fontWeight: FontWeight.w500);
 
     return Scaffold(
       backgroundColor: colors.surface,
@@ -227,37 +255,43 @@ class _AppShellState extends State<AppShell> {
                   Container(
                     width: isExtendedRail ? 244 : 84,
                     color: colors.surface,
-                    child: NavigationRail(
-                      selectedIndex: _destinations.indexOf(
-                        _selectedDestination,
+                    child: NavigationRailTheme(
+                      data: NavigationRailThemeData(
+                        selectedLabelTextStyle: railLabelStyle,
+                        unselectedLabelTextStyle: railLabelStyle,
                       ),
-                      onDestinationSelected: (index) =>
-                          _navigate(_destinations[index].section),
-                      extended: isExtendedRail,
-                      minWidth: 76,
-                      minExtendedWidth: 228,
-                      labelType: isExtendedRail
-                          ? NavigationRailLabelType.none
-                          : NavigationRailLabelType.all,
-                      groupAlignment: -1,
-                      useIndicator: true,
-                      scrollable: true,
-                      destinations: _destinations
-                          .map(
-                            (destination) => NavigationRailDestination(
-                              icon: Tooltip(
-                                message: destination.title,
-                                child: Icon(destination.icon),
+                      child: NavigationRail(
+                        selectedIndex: _destinations.indexOf(
+                          _selectedDestination,
+                        ),
+                        onDestinationSelected: (index) =>
+                            _navigate(_destinations[index].section),
+                        extended: isExtendedRail,
+                        minWidth: 76,
+                        minExtendedWidth: 228,
+                        labelType: isExtendedRail
+                            ? NavigationRailLabelType.none
+                            : NavigationRailLabelType.all,
+                        groupAlignment: -1,
+                        useIndicator: true,
+                        scrollable: true,
+                        destinations: _destinations
+                            .map(
+                              (destination) => NavigationRailDestination(
+                                icon: Tooltip(
+                                  message: destination.title,
+                                  child: Icon(destination.icon),
+                                ),
+                                selectedIcon: Icon(destination.selectedIcon),
+                                label: Text(
+                                  destination.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
                               ),
-                              selectedIcon: Icon(destination.selectedIcon),
-                              label: Text(
-                                destination.title,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                          )
-                          .toList(growable: false),
+                            )
+                            .toList(growable: false),
+                      ),
                     ),
                   ),
                   VerticalDivider(
@@ -320,6 +354,8 @@ enum _ShellSection {
   plans,
   finance,
   library,
+  archives,
+  inventory,
   settings,
 }
 

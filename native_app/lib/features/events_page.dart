@@ -18,6 +18,10 @@ class _EventsPageState extends State<EventsPage> {
   late final MediaStore _mediaStore;
   final TextEditingController _searchController = TextEditingController();
   List<EventModel> _events = const [];
+  List<Semester> _semesters = const [];
+  List<RecurringActivityModel> _recurringActivities = const [];
+  String _semesterFilterKey = 'all';
+  bool _hasLoadedFilter = false;
   String _query = '';
 
   @override
@@ -38,8 +42,40 @@ class _EventsPageState extends State<EventsPage> {
     super.dispose();
   }
 
-  void _loadEvents() {
-    setState(() => _events = widget.repository.getEvents());
+  void _loadEvents({String? filterKey}) {
+    final semesters = widget.repository.getSemesters();
+    final recurringActivities = widget.repository.getRecurringActivities();
+    final currentSemester = widget.repository.getCurrentSemester();
+    var selectedFilter = filterKey ?? _semesterFilterKey;
+    if (!_hasLoadedFilter && filterKey == null) {
+      selectedFilter = currentSemester == null
+          ? 'all'
+          : 'semester:${currentSemester.id}';
+    }
+    final semesterIds = semesters.map((semester) => semester.id).toSet();
+    if (selectedFilter.startsWith('semester:')) {
+      final id = int.tryParse(selectedFilter.substring('semester:'.length));
+      if (id == null || !semesterIds.contains(id)) {
+        selectedFilter = currentSemester == null
+            ? 'all'
+            : 'semester:${currentSemester.id}';
+      }
+    }
+    var events = selectedFilter.startsWith('semester:')
+        ? widget.repository.getEvents(
+            semesterId: int.parse(selectedFilter.substring('semester:'.length)),
+          )
+        : widget.repository.getEvents();
+    if (selectedFilter == 'unassigned') {
+      events = events.where((event) => event.semesterId == null).toList();
+    }
+    setState(() {
+      _semesters = semesters;
+      _recurringActivities = recurringActivities;
+      _semesterFilterKey = selectedFilter;
+      _hasLoadedFilter = true;
+      _events = events;
+    });
   }
 
   List<EventModel> get _visibleEvents {
@@ -54,15 +90,30 @@ class _EventsPageState extends State<EventsPage> {
         .toList(growable: false);
   }
 
+  String _semesterLabel(int? semesterId) {
+    if (semesterId == null) return '未指定学期';
+    for (final semester in _semesters) {
+      if (semester.id == semesterId) return semester.label;
+    }
+    return '历史学期';
+  }
+
+  String? _recurringActivityTitle(int? recurringActivityId) {
+    if (recurringActivityId == null) return null;
+    for (final activity in _recurringActivities) {
+      if (activity.id == recurringActivityId) return activity.title;
+    }
+    return null;
+  }
+
   Future<void> _editEvent([EventModel? event]) async {
     final selectedMembers = event == null
         ? const <Member>[]
         : widget.repository.getEventParticipants(event.id);
-    final currentSemester = widget.repository.getCurrentSemester();
     final roster = <int, Member>{};
-    if (currentSemester != null) {
+    for (final semester in _semesters) {
       for (final member in widget.repository.getMembers(
-        currentSemester.id,
+        semester.id,
         activeOnly: true,
       )) {
         roster[member.id] = member;
@@ -78,6 +129,11 @@ class _EventsPageState extends State<EventsPage> {
         event: event,
         members: roster.values.toList(growable: false),
         selectedMemberIds: selectedMembers.map((member) => member.id).toSet(),
+        semesters: _semesters,
+        recurringActivities: _recurringActivities,
+        defaultSemesterId:
+            widget.repository.getCurrentSemester()?.id ??
+            (_semesters.isEmpty ? null : _semesters.first.id),
       ),
     );
     if (draft == null || !mounted) return;
@@ -89,6 +145,9 @@ class _EventsPageState extends State<EventsPage> {
               eventDate: draft.eventDate,
               location: draft.location,
               summary: draft.summary,
+              semesterId: draft.semesterId,
+              recurringActivityId: draft.recurringActivityId,
+              eventType: draft.eventType,
             )
           : event.id;
       if (event != null) {
@@ -99,9 +158,18 @@ class _EventsPageState extends State<EventsPage> {
             eventDate: draft.eventDate,
             location: draft.location,
             summary: draft.summary,
+            semesterId: draft.semesterId,
+            recurringActivityId: draft.recurringActivityId,
+            eventType: draft.eventType,
             createdAt: event.createdAt,
             updatedAt: event.updatedAt,
           ),
+        );
+        widget.repository.updateEventClassification(
+          eventId: event.id,
+          semesterId: draft.semesterId,
+          recurringActivityId: draft.recurringActivityId,
+          eventType: draft.eventType,
         );
       }
       widget.repository.replaceEventParticipants(id, draft.memberIds);
@@ -250,6 +318,44 @@ class _EventsPageState extends State<EventsPage> {
                     ),
                   ),
                   const SizedBox(height: 22),
+                  SizedBox(
+                    width: constraints.maxWidth < 540
+                        ? constraints.maxWidth
+                        : 320,
+                    child: DropdownButtonFormField<String>(
+                      initialValue: _semesterFilterKey,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: '按学期筛选',
+                        prefixIcon: Icon(Icons.school_outlined),
+                        border: OutlineInputBorder(),
+                      ),
+                      items: [
+                        const DropdownMenuItem(
+                          value: 'all',
+                          child: Text('全部学期'),
+                        ),
+                        const DropdownMenuItem(
+                          value: 'unassigned',
+                          child: Text('未指定学期'),
+                        ),
+                        ..._semesters.map(
+                          (semester) => DropdownMenuItem(
+                            value: 'semester:${semester.id}',
+                            child: Text(
+                              '${semester.label}${semester.isCurrent ? ' · 当前' : ''}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) _loadEvents(filterKey: value);
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 22),
                   if (events.isEmpty)
                     _EventsEmptyState(hasQuery: _query.isNotEmpty)
                   else
@@ -265,6 +371,10 @@ class _EventsPageState extends State<EventsPage> {
                       ),
                       itemBuilder: (context, index) => _EventCard(
                         event: events[index],
+                        semesterLabel: _semesterLabel(events[index].semesterId),
+                        recurringActivityTitle: _recurringActivityTitle(
+                          events[index].recurringActivityId,
+                        ),
                         participantCount: widget.repository
                             .getEventParticipants(events[index].id)
                             .length,
@@ -292,6 +402,8 @@ class _EventsPageState extends State<EventsPage> {
 class _EventCard extends StatelessWidget {
   const _EventCard({
     required this.event,
+    required this.semesterLabel,
+    required this.recurringActivityTitle,
     required this.participantCount,
     required this.attachmentCount,
     required this.onOpen,
@@ -300,6 +412,8 @@ class _EventCard extends StatelessWidget {
   });
 
   final EventModel event;
+  final String semesterLabel;
+  final String? recurringActivityTitle;
   final int participantCount;
   final int attachmentCount;
   final VoidCallback onOpen;
@@ -313,6 +427,9 @@ class _EventCard extends StatelessWidget {
     final dateLabel = parsedDate == null
         ? (event.eventDate.isEmpty ? '日期未设置' : event.eventDate)
         : '${parsedDate.year}年${parsedDate.month}月${parsedDate.day}日';
+    final classificationLabel = recurringActivityTitle == null
+        ? semesterLabel
+        : '$semesterLabel · $recurringActivityTitle';
 
     return Card(
       margin: EdgeInsets.zero,
@@ -385,7 +502,23 @@ class _EventCard extends StatelessWidget {
                   ),
                 ],
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Icon(Icons.school_outlined, size: 15, color: colors.primary),
+                  const SizedBox(width: 5),
+                  Flexible(
+                    child: Text(
+                      classificationLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall
+                          ?.copyWith(color: colors.onSurfaceVariant),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
               if (event.location.isNotEmpty)
                 _EventMetaLine(
                   icon: Icons.place_outlined,
@@ -502,11 +635,17 @@ class _EventEditorDialog extends StatefulWidget {
     required this.event,
     required this.members,
     required this.selectedMemberIds,
+    required this.semesters,
+    required this.recurringActivities,
+    required this.defaultSemesterId,
   });
 
   final EventModel? event;
   final List<Member> members;
   final Set<int> selectedMemberIds;
+  final List<Semester> semesters;
+  final List<RecurringActivityModel> recurringActivities;
+  final int? defaultSemesterId;
 
   @override
   State<_EventEditorDialog> createState() => _EventEditorDialogState();
@@ -519,6 +658,8 @@ class _EventEditorDialogState extends State<_EventEditorDialog> {
   late final TextEditingController _location;
   late final TextEditingController _summary;
   late final Set<int> _selectedMemberIds;
+  late int _semesterChoice;
+  late int _recurringActivityChoice;
 
   @override
   void initState() {
@@ -533,6 +674,22 @@ class _EventEditorDialogState extends State<_EventEditorDialog> {
     _location = TextEditingController(text: event?.location ?? '');
     _summary = TextEditingController(text: event?.summary ?? '');
     _selectedMemberIds = Set<int>.from(widget.selectedMemberIds);
+    final existingSemesterId = event?.semesterId;
+    _semesterChoice =
+        existingSemesterId != null &&
+            widget.semesters.any(
+              (semester) => semester.id == existingSemesterId,
+            )
+        ? existingSemesterId
+        : widget.defaultSemesterId ?? -1;
+    final existingActivityId = event?.recurringActivityId;
+    _recurringActivityChoice =
+        existingActivityId != null &&
+            widget.recurringActivities.any(
+              (activity) => activity.id == existingActivityId,
+            )
+        ? existingActivityId
+        : -1;
   }
 
   @override
@@ -558,6 +715,13 @@ class _EventEditorDialogState extends State<_EventEditorDialog> {
 
   void _save() {
     if (!_formKey.currentState!.validate()) return;
+    RecurringActivityModel? recurringActivity;
+    for (final activity in widget.recurringActivities) {
+      if (activity.id == _recurringActivityChoice) {
+        recurringActivity = activity;
+        break;
+      }
+    }
     Navigator.pop(
       context,
       _EventDraft(
@@ -565,6 +729,11 @@ class _EventEditorDialogState extends State<_EventEditorDialog> {
         eventDate: _date.text.trim(),
         location: _location.text.trim(),
         summary: _summary.text.trim(),
+        semesterId: _semesterChoice < 0 ? null : _semesterChoice,
+        recurringActivityId: _recurringActivityChoice < 0
+            ? null
+            : _recurringActivityChoice,
+        eventType: recurringActivity?.activityType,
         memberIds: _selectedMemberIds,
       ),
     );
@@ -582,6 +751,70 @@ class _EventEditorDialogState extends State<_EventEditorDialog> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                DropdownButtonFormField<int>(
+                  initialValue: _semesterChoice,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    labelText: '所属学期',
+                    prefixIcon: Icon(Icons.school_outlined),
+                  ),
+                  items: [
+                    const DropdownMenuItem(value: -1, child: Text('未指定学期')),
+                    ...widget.semesters.map(
+                      (semester) => DropdownMenuItem(
+                        value: semester.id,
+                        child: Text(
+                          '${semester.label}${semester.isCurrent ? ' · 当前' : ''}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                  ],
+                  onChanged: (value) {
+                    if (value != null) setState(() => _semesterChoice = value);
+                  },
+                ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<int>(
+                  initialValue: _recurringActivityChoice,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    labelText: '周期活动',
+                    prefixIcon: Icon(Icons.repeat_rounded),
+                  ),
+                  items: [
+                    const DropdownMenuItem(
+                      value: -1,
+                      child: Text('单次活动（自由填写名称）'),
+                    ),
+                    ...widget.recurringActivities.map(
+                      (activity) => DropdownMenuItem(
+                        value: activity.id,
+                        child: Text(
+                          '${activity.title} · ${activity.activityType}${activity.active ? '' : '（已停用）'}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                  ],
+                  onChanged: (value) {
+                    if (value == null) return;
+                    setState(() {
+                      _recurringActivityChoice = value;
+                      if (value >= 0) {
+                        for (final activity in widget.recurringActivities) {
+                          if (activity.id == value) {
+                            _title.text = activity.title;
+                            break;
+                          }
+                        }
+                      }
+                    });
+                  },
+                ),
+                const SizedBox(height: 12),
                 TextFormField(
                   controller: _title,
                   autofocus: true,
@@ -589,6 +822,7 @@ class _EventEditorDialogState extends State<_EventEditorDialog> {
                   decoration: const InputDecoration(
                     labelText: '活动名称 *',
                     prefixIcon: Icon(Icons.event_outlined),
+                    helperText: '单次活动可自由填写；选择周期活动会自动填入名称。',
                   ),
                   validator: (value) =>
                       (value ?? '').trim().isEmpty ? '请输入活动名称' : null,
@@ -715,6 +949,9 @@ class _EventDraft {
     required this.eventDate,
     required this.location,
     required this.summary,
+    required this.semesterId,
+    required this.recurringActivityId,
+    required this.eventType,
     required this.memberIds,
   });
 
@@ -722,6 +959,9 @@ class _EventDraft {
   final String eventDate;
   final String location;
   final String summary;
+  final int? semesterId;
+  final int? recurringActivityId;
+  final String? eventType;
   final Set<int> memberIds;
 }
 

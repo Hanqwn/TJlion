@@ -23,7 +23,7 @@ class LionRepository {
        _supportDirectory = supportDirectory,
        _databaseFile = databaseFile;
 
-  static const int schemaVersion = 4;
+  static const int schemaVersion = 5;
   static const String defaultSchemaAsset = 'assets/schema.sql';
   static const String databaseFileName = 'lion_manager.sqlite3';
   static const String _mediaDirectoryName = 'media';
@@ -115,7 +115,7 @@ class LionRepository {
         'Database schema version $version is newer than this app supports ($schemaVersion).',
       );
     }
-    if (version == schemaVersion) return;
+    if (version == schemaVersion && _hasCompleteV5Schema(database)) return;
 
     database.execute('BEGIN IMMEDIATE');
     try {
@@ -186,12 +186,285 @@ class LionRepository {
         );
         database.execute('PRAGMA user_version = 4');
       }
+      _ensureV5Schema(database);
+      database.execute('PRAGMA user_version = 5');
       database.execute('COMMIT');
     } catch (_) {
       database.execute('ROLLBACK');
       rethrow;
     }
   }
+
+  static bool _hasCompleteV5Schema(Database database) {
+    final tables = database
+        .select("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .map((row) => row['name'].toString())
+        .toSet();
+    if (!const {
+      'member_profiles',
+      'member_profile_student_ids',
+      'recurring_activities',
+      'inventory_items',
+      'inventory_movements',
+      'media_file_paths',
+    }.every(tables.contains)) {
+      return false;
+    }
+    Set<String> columns(String table) => database
+        .select('PRAGMA table_info($table)')
+        .map((row) => row['name'].toString())
+        .toSet();
+    return const {'person_id', 'contact'}.every(columns('members').contains) &&
+        const {
+          'semester_id',
+          'recurring_activity_id',
+          'event_type',
+        }.every(columns('events').contains) &&
+        const {'category', 'unit'}.every(columns('inventory_items').contains);
+  }
+
+  static void _ensureV5Schema(Database database) {
+    final tables = database
+        .select("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .map((row) => row['name'].toString())
+        .toSet();
+    final originalMemberColumns = database
+        .select('PRAGMA table_info(members)')
+        .map((row) => row['name'].toString())
+        .toSet();
+    final hadMemberProfiles = originalMemberColumns.contains('person_id');
+
+    if (tables.contains('people') && !tables.contains('member_profiles')) {
+      database.execute('ALTER TABLE people RENAME TO member_profiles');
+    }
+    database.execute('''
+      CREATE TABLE IF NOT EXISTS member_profiles (
+        id INTEGER PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        birthday TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''');
+
+    database.execute('''
+      CREATE TABLE IF NOT EXISTS media_file_paths (
+        media_key TEXT PRIMARY KEY,
+        relative_path TEXT NOT NULL UNIQUE,
+        updated_at TEXT NOT NULL
+      )
+    ''');
+    database.execute('''
+      INSERT OR IGNORE INTO media_file_paths (media_key, relative_path, updated_at)
+      SELECT media_key, 'media/' || media_key, created_at
+      FROM media_assets WHERE media_key <> ''
+    ''');
+
+    final memberColumns = database
+        .select('PRAGMA table_info(members)')
+        .map((row) => row['name'].toString())
+        .toSet();
+    if (!memberColumns.contains('person_id')) {
+      database.execute(
+        'ALTER TABLE members ADD COLUMN person_id INTEGER REFERENCES member_profiles(id)',
+      );
+    }
+    if (!memberColumns.contains('contact')) {
+      database.execute(
+        "ALTER TABLE members ADD COLUMN contact TEXT NOT NULL DEFAULT ''",
+      );
+    }
+
+    database.execute('''
+      CREATE TABLE IF NOT EXISTS member_profile_student_ids (
+        normalized_student_no TEXT PRIMARY KEY,
+        profile_id INTEGER NOT NULL REFERENCES member_profiles(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL
+      )
+    ''');
+    database.execute('''
+      CREATE INDEX IF NOT EXISTS idx_member_profile_student_ids_profile
+      ON member_profile_student_ids(profile_id)
+    ''');
+
+    database.execute('''
+      CREATE TABLE IF NOT EXISTS recurring_activities (
+        id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL,
+        activity_type TEXT NOT NULL DEFAULT 'other',
+        description TEXT NOT NULL DEFAULT '',
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''');
+
+    final eventColumns = database
+        .select('PRAGMA table_info(events)')
+        .map((row) => row['name'].toString())
+        .toSet();
+    if (!eventColumns.contains('semester_id')) {
+      database.execute(
+        'ALTER TABLE events ADD COLUMN semester_id INTEGER REFERENCES semesters(id) ON DELETE SET NULL',
+      );
+    }
+    if (!eventColumns.contains('recurring_activity_id')) {
+      database.execute(
+        'ALTER TABLE events ADD COLUMN recurring_activity_id INTEGER REFERENCES recurring_activities(id) ON DELETE SET NULL',
+      );
+    }
+    if (!eventColumns.contains('event_type')) {
+      database.execute(
+        "ALTER TABLE events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'other'",
+      );
+    }
+
+    database.execute('''
+      CREATE TABLE IF NOT EXISTS inventory_items (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT '',
+        unit TEXT NOT NULL DEFAULT '',
+        current_quantity INTEGER NOT NULL DEFAULT 0 CHECK (current_quantity >= 0),
+        location TEXT NOT NULL DEFAULT '',
+        condition TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''');
+    final inventoryItemColumns = database
+        .select('PRAGMA table_info(inventory_items)')
+        .map((row) => row['name'].toString())
+        .toSet();
+    if (!inventoryItemColumns.contains('category')) {
+      database.execute(
+        "ALTER TABLE inventory_items ADD COLUMN category TEXT NOT NULL DEFAULT ''",
+      );
+    }
+    if (!inventoryItemColumns.contains('unit')) {
+      database.execute(
+        "ALTER TABLE inventory_items ADD COLUMN unit TEXT NOT NULL DEFAULT ''",
+      );
+    }
+    database.execute('''
+      CREATE TABLE IF NOT EXISTS inventory_movements (
+        id INTEGER PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+        movement_type TEXT NOT NULL CHECK (
+          movement_type IN ('received', 'purchased', 'found', 'lost', 'stolen', 'disposed', 'adjustment')
+        ),
+        quantity_delta INTEGER NOT NULL CHECK (quantity_delta <> 0),
+        CHECK (
+          (movement_type IN ('received', 'purchased', 'found') AND quantity_delta > 0) OR
+          (movement_type IN ('lost', 'stolen', 'disposed') AND quantity_delta < 0) OR
+          movement_type = 'adjustment'
+        ),
+        movement_date TEXT NOT NULL,
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      )
+    ''');
+
+    // v4 rows have no identity link. Match nonblank identifiers after trim,
+    // internal whitespace removal, and case folding. A blank-ID row always
+    // receives its own profile; names and birthdays never merge people.
+    final members = database.select('''
+      SELECT id, person_id, student_no, name, birthday
+      FROM members
+      ORDER BY semester_id, id
+    ''');
+    for (final row in members) {
+      final memberId = (row['id'] as num).toInt();
+      final existingPersonId = row['person_id'] == null
+          ? null
+          : (row['person_id'] as num).toInt();
+      final studentNo = row['student_no']?.toString() ?? '';
+      final studentKey = _normalizedStudentNo(studentNo);
+      final name = row['name']?.toString() ?? '';
+      final birthday = row['birthday']?.toString() ?? '';
+      final now = _now();
+
+      int? profileId = existingPersonId;
+      if (studentKey.isNotEmpty) {
+        final mapped = database.select(
+          'SELECT profile_id FROM member_profile_student_ids WHERE normalized_student_no = ?',
+          [studentKey],
+        );
+        if (mapped.isNotEmpty) {
+          profileId = (mapped.first['profile_id'] as num).toInt();
+        }
+      } else if (!hadMemberProfiles) {
+        // This branch is only for a migration from the old roster schema.
+        // Each no-ID row stays independent, even when names match.
+        profileId = null;
+      }
+
+      if (profileId == null) {
+        database.execute(
+          '''INSERT INTO member_profiles
+             (display_name, birthday, created_at, updated_at)
+             VALUES (?, ?, ?, ?)''',
+          [name, birthday, now, now],
+        );
+        profileId = database.lastInsertRowId;
+      }
+
+      database.execute('UPDATE members SET person_id = ? WHERE id = ?', [
+        profileId,
+        memberId,
+      ]);
+      if (studentKey.isNotEmpty) {
+        database.execute(
+          '''
+          INSERT OR IGNORE INTO member_profile_student_ids
+            (normalized_student_no, profile_id, created_at)
+          VALUES (?, ?, ?)
+        ''',
+          [studentKey, profileId, now],
+        );
+        final canonical = database.select(
+          'SELECT profile_id FROM member_profile_student_ids WHERE normalized_student_no = ?',
+          [studentKey],
+        );
+        final canonicalProfileId = (canonical.first['profile_id'] as num)
+            .toInt();
+        if (canonicalProfileId != profileId) {
+          database.execute('UPDATE members SET person_id = ? WHERE id = ?', [
+            canonicalProfileId,
+            memberId,
+          ]);
+        }
+      }
+    }
+
+    // Older development builds created a uniqueness rule that could reject
+    // duplicate source roster rows. Keep the lookup index while allowing all
+    // original term rows to remain linked to the same stable profile.
+    database.execute('DROP INDEX IF EXISTS idx_members_semester_person');
+    database.execute('''
+      CREATE INDEX IF NOT EXISTS idx_members_semester_person
+      ON members(semester_id, person_id)
+    ''');
+    database.execute('''
+      CREATE INDEX IF NOT EXISTS idx_members_person ON members(person_id)
+    ''');
+    database.execute('''
+      CREATE INDEX IF NOT EXISTS idx_events_semester_type
+      ON events(semester_id, event_type, event_date DESC)
+    ''');
+    database.execute('''
+      CREATE INDEX IF NOT EXISTS idx_events_recurring_activity
+      ON events(recurring_activity_id, event_date DESC)
+    ''');
+    database.execute('''
+      CREATE INDEX IF NOT EXISTS idx_inventory_movements_item_date
+      ON inventory_movements(item_id, movement_date DESC, id DESC)
+    ''');
+  }
+
+  static String _normalizedStudentNo(String value) =>
+      value.trim().replaceAll(RegExp(r'\s+'), '').toUpperCase();
 
   static const List<String> _createTableStatements = [
     '''CREATE TABLE IF NOT EXISTS semesters (
@@ -201,15 +474,24 @@ class LionRepository {
       end_date TEXT,
       is_current INTEGER NOT NULL DEFAULT 0 CHECK (is_current IN (0, 1))
     )''',
+    '''CREATE TABLE IF NOT EXISTS member_profiles (
+      id INTEGER PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      birthday TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )''',
     '''CREATE TABLE IF NOT EXISTS members (
       id INTEGER PRIMARY KEY,
       semester_id INTEGER NOT NULL REFERENCES semesters(id) ON DELETE CASCADE,
+      person_id INTEGER REFERENCES member_profiles(id),
       student_no TEXT NOT NULL DEFAULT '',
       name TEXT NOT NULL,
       grade TEXT NOT NULL DEFAULT '',
       major TEXT NOT NULL DEFAULT '',
       position TEXT NOT NULL DEFAULT '',
       birthday TEXT NOT NULL DEFAULT '',
+      contact TEXT NOT NULL DEFAULT '',
       notes TEXT NOT NULL DEFAULT '',
       active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
       UNIQUE (semester_id, student_no, name)
@@ -331,6 +613,7 @@ class LionRepository {
       'is_current': 'INTEGER NOT NULL DEFAULT 0',
     },
     'members': {
+      'person_id': 'INTEGER REFERENCES member_profiles(id)',
       'semester_id': 'INTEGER NOT NULL DEFAULT 0',
       'student_no': "TEXT NOT NULL DEFAULT ''",
       'name': "TEXT NOT NULL DEFAULT ''",
@@ -338,6 +621,7 @@ class LionRepository {
       'major': "TEXT NOT NULL DEFAULT ''",
       'position': "TEXT NOT NULL DEFAULT ''",
       'birthday': "TEXT NOT NULL DEFAULT ''",
+      'contact': "TEXT NOT NULL DEFAULT ''",
       'notes': "TEXT NOT NULL DEFAULT ''",
       'active': 'INTEGER NOT NULL DEFAULT 1',
     },
@@ -553,7 +837,8 @@ class LionRepository {
     final activeClause = activeOnly ? ' AND active = 1' : '';
     return _select(
       '''
-      SELECT id, semester_id, student_no, name, grade, major, position, birthday, notes, active
+      SELECT id, person_id, semester_id, student_no, name, grade, major, position,
+             birthday, contact, notes, active
       FROM members WHERE semester_id = ?$activeClause ORDER BY name, id
     ''',
       [semesterId],
@@ -564,7 +849,8 @@ class LionRepository {
     _ensureOpen();
     final rows = _select(
       '''
-      SELECT id, semester_id, student_no, name, grade, major, position, birthday, notes, active
+      SELECT id, person_id, semester_id, student_no, name, grade, major, position,
+             birthday, contact, notes, active
       FROM members WHERE id = ?
     ''',
       [memberId],
@@ -572,85 +858,292 @@ class LionRepository {
     return rows.isEmpty ? null : Member.fromMap(rows.first);
   }
 
-  /// Returns the roster rows for the same member across semesters.
-  /// Without a student number, only the selected roster row is returned.
-  List<Member> getMemberSemesterHistory(Member member) {
+  List<PersonProfile> getPeople() {
+    return getMemberProfiles();
+  }
+
+  /// Lists the global archive, including profiles without a current roster row.
+  List<PersonProfile> getMemberProfiles() {
     _ensureOpen();
-    final studentNo = member.studentNo.trim();
-    final rows = studentNo.isEmpty
-        ? _select(
-            '''
-            SELECT id, semester_id, student_no, name, grade, major, position,
-                   birthday, notes, active
-            FROM members WHERE id = ?
-          ''',
-            [member.id],
-          )
-        : _select(
-            '''
-            SELECT id, semester_id, student_no, name, grade, major, position,
-                   birthday, notes, active
-            FROM members
-            WHERE trim(student_no) = ?
-            ORDER BY
-              (SELECT start_date FROM semesters WHERE semesters.id = members.semester_id),
-              semester_id, id
-          ''',
-            [studentNo],
+    return _select('''
+      SELECT id, display_name, birthday, created_at, updated_at
+      FROM member_profiles
+      ORDER BY lower(display_name), id
+    ''').map(PersonProfile.fromMap).toList(growable: false);
+  }
+
+  PersonProfile? getPerson(int personId) {
+    return getMemberProfile(personId);
+  }
+
+  /// Returns one global profile by its stable ID.
+  PersonProfile? getMemberProfile(int profileId) {
+    _ensureOpen();
+    final rows = _select(
+      '''
+      SELECT id, display_name, birthday, created_at, updated_at
+      FROM member_profiles WHERE id = ?
+    ''',
+      [profileId],
+    );
+    return rows.isEmpty ? null : PersonProfile.fromMap(rows.first);
+  }
+
+  /// Manually edits archive fields without changing term-specific member rows.
+  void updatePersonProfile(PersonProfile profile) {
+    _ensureOpen();
+    _database.execute(
+      '''UPDATE member_profiles
+         SET display_name = ?, birthday = ?, updated_at = ? WHERE id = ?''',
+      [profile.displayName.trim(), profile.birthday.trim(), _now(), profile.id],
+    );
+    _requireChangedRow('Person profile', profile.id);
+  }
+
+  /// Links a semester roster row to a selected global profile. When the row
+  /// has a student number, all rows with the same normalized number are linked
+  /// together so that identifier continues to resolve to one profile.
+  void linkMemberToProfile({required int memberId, required int profileId}) {
+    _ensureOpen();
+    _transaction(() {
+      _requireExists('member_profiles', profileId, 'Person profile');
+      final rows = _database.select(
+        'SELECT student_no FROM members WHERE id = ?',
+        [memberId],
+      );
+      if (rows.isEmpty) throw ArgumentError('Member $memberId does not exist.');
+      final key = _normalizedStudentNo(
+        rows.first['student_no']?.toString() ?? '',
+      );
+      _database.execute('UPDATE members SET person_id = ? WHERE id = ?', [
+        profileId,
+        memberId,
+      ]);
+      if (key.isEmpty) return;
+
+      _database.execute(
+        '''
+        INSERT INTO member_profile_student_ids
+          (normalized_student_no, profile_id, created_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(normalized_student_no) DO UPDATE SET
+          profile_id = excluded.profile_id
+      ''',
+        [key, profileId, _now()],
+      );
+      final matchingRows = _database.select(
+        'SELECT id, student_no FROM members',
+      );
+      for (final matching in matchingRows) {
+        if (_normalizedStudentNo(matching['student_no']?.toString() ?? '') ==
+            key) {
+          _database.execute('UPDATE members SET person_id = ? WHERE id = ?', [
+            profileId,
+            matching['id'],
+          ]);
+        }
+      }
+    });
+  }
+
+  /// Returns every semester snapshot that belongs to one long-term profile.
+  List<Member> getMemberSemesterHistory(Member member) {
+    return getMemberProfileHistory(member.personId);
+  }
+
+  /// Returns all term-specific roster records for one global profile.
+  List<Member> getMemberProfileHistory(int profileId) {
+    _ensureOpen();
+    return _select(
+      '''
+      SELECT id, person_id, semester_id, student_no, name, grade, major, position,
+             birthday, contact, notes, active
+      FROM members
+      WHERE person_id = ?
+      ORDER BY
+        (SELECT start_date FROM semesters WHERE semesters.id = members.semester_id),
+        semester_id, id
+    ''',
+      [profileId],
+    ).map(Member.fromMap).toList(growable: false);
+  }
+
+  /// Returns distinct historical events attended by any term row in a profile.
+  List<EventModel> getProfileEventHistory(int profileId) {
+    _ensureOpen();
+    return _select(
+      '''
+      SELECT DISTINCT e.id, e.title, e.event_date, e.location, e.summary,
+             e.semester_id, e.recurring_activity_id, e.event_type,
+             e.created_at, e.updated_at
+      FROM events AS e
+      JOIN event_members AS em ON em.event_id = e.id
+      JOIN members AS m ON m.id = em.member_id
+      WHERE m.person_id = ?
+      ORDER BY e.event_date DESC, e.id DESC
+    ''',
+      [profileId],
+    ).map(EventModel.fromMap).toList(growable: false);
+  }
+
+  int _createPerson(String name, String birthday, String now) {
+    _database.execute(
+      '''INSERT INTO member_profiles (display_name, birthday, created_at, updated_at)
+         VALUES (?, ?, ?, ?)''',
+      [name.trim(), birthday.trim(), now, now],
+    );
+    return _database.lastInsertRowId;
+  }
+
+  int _resolveProfileForMember({
+    required int? selectedProfileId,
+    required String studentNo,
+    required String name,
+    required String birthday,
+    required String now,
+  }) {
+    final key = _normalizedStudentNo(studentNo);
+    if (selectedProfileId != null) {
+      _requireExists('member_profiles', selectedProfileId, 'Person profile');
+      if (key.isNotEmpty) {
+        final mapped = _database.select(
+          'SELECT profile_id FROM member_profile_student_ids WHERE normalized_student_no = ?',
+          [key],
+        );
+        if (mapped.isNotEmpty &&
+            (mapped.first['profile_id'] as num).toInt() != selectedProfileId) {
+          throw ArgumentError(
+            'Student number $studentNo is already linked to another profile.',
           );
-    return rows.map(Member.fromMap).toList(growable: false);
+        }
+        _database.execute(
+          '''
+          INSERT OR IGNORE INTO member_profile_student_ids
+            (normalized_student_no, profile_id, created_at)
+          VALUES (?, ?, ?)
+        ''',
+          [key, selectedProfileId, now],
+        );
+      }
+      return selectedProfileId;
+    }
+
+    if (key.isNotEmpty) {
+      final mapped = _database.select(
+        'SELECT profile_id FROM member_profile_student_ids WHERE normalized_student_no = ?',
+        [key],
+      );
+      if (mapped.isNotEmpty) return (mapped.first['profile_id'] as num).toInt();
+    }
+
+    final profileId = _createPerson(name, birthday, now);
+    if (key.isNotEmpty) {
+      _database.execute(
+        '''
+        INSERT INTO member_profile_student_ids
+          (normalized_student_no, profile_id, created_at)
+        VALUES (?, ?, ?)
+      ''',
+        [key, profileId, now],
+      );
+    }
+    return profileId;
   }
 
   int addMember({
     required int semesterId,
+    int? personId,
     required String name,
     String studentNo = '',
     String grade = '',
     String major = '',
     String position = '',
     String birthday = '',
+    String contact = '',
     String notes = '',
     bool active = true,
   }) {
     _ensureOpen();
-    _database.execute(
-      '''INSERT INTO members
-         (semester_id, student_no, name, grade, major, position, birthday, notes, active)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-      [
-        semesterId,
-        studentNo,
-        name,
-        grade,
-        major,
-        position,
-        birthday,
-        notes,
-        active ? 1 : 0,
-      ],
-    );
-    return _database.lastInsertRowId;
+    return _transaction(() {
+      final now = _now();
+      final resolvedPersonId = _resolveProfileForMember(
+        selectedProfileId: personId,
+        studentNo: studentNo,
+        name: name,
+        birthday: birthday,
+        now: now,
+      );
+      _database.execute(
+        '''INSERT INTO members
+           (semester_id, person_id, student_no, name, grade, major, position,
+            birthday, contact, notes, active)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        [
+          semesterId,
+          resolvedPersonId,
+          studentNo,
+          name,
+          grade,
+          major,
+          position,
+          birthday,
+          contact,
+          notes,
+          active ? 1 : 0,
+        ],
+      );
+      return _database.lastInsertRowId;
+    });
   }
 
   void updateMember(Member member) {
     _ensureOpen();
-    _database.execute(
-      '''UPDATE members SET semester_id = ?, student_no = ?, name = ?, grade = ?,
-         major = ?, position = ?, birthday = ?, notes = ?, active = ? WHERE id = ?''',
-      [
-        member.semesterId,
-        member.studentNo,
-        member.name,
-        member.grade,
-        member.major,
-        member.position,
-        member.birthday,
-        member.notes,
-        member.active ? 1 : 0,
-        member.id,
-      ],
-    );
-    _requireChangedRow('Member', member.id);
+    _transaction(() {
+      final now = _now();
+      _requireExists('member_profiles', member.personId, 'Person profile');
+      _database.execute(
+        '''UPDATE members SET semester_id = ?, person_id = ?, student_no = ?,
+           name = ?, grade = ?, major = ?, position = ?, birthday = ?,
+           contact = COALESCE(?, contact),
+           notes = ?, active = ? WHERE id = ?''',
+        [
+          member.semesterId,
+          member.personId,
+          member.studentNo,
+          member.name,
+          member.grade,
+          member.major,
+          member.position,
+          member.birthday,
+          member.contact,
+          member.notes,
+          member.active ? 1 : 0,
+          member.id,
+        ],
+      );
+      _requireChangedRow('Member', member.id);
+      final key = _normalizedStudentNo(member.studentNo);
+      if (key.isNotEmpty) {
+        final mapped = _database.select(
+          'SELECT profile_id FROM member_profile_student_ids WHERE normalized_student_no = ?',
+          [key],
+        );
+        if (mapped.isNotEmpty &&
+            (mapped.first['profile_id'] as num).toInt() != member.personId) {
+          throw ArgumentError(
+            'Student number ${member.studentNo} is already linked to another profile.',
+          );
+        }
+        _database.execute(
+          '''
+          INSERT OR IGNORE INTO member_profile_student_ids
+            (normalized_student_no, profile_id, created_at)
+          VALUES (?, ?, ?)
+        ''',
+          [key, member.personId, now],
+        );
+      }
+    });
   }
 
   void deleteMember(int memberId) {
@@ -658,8 +1151,16 @@ class LionRepository {
     _database.execute('DELETE FROM members WHERE id = ?', [memberId]);
   }
 
-  /// Copies roster fields into another semester, leaving existing rows intact.
-  /// Duplicate `(student_no, name)` pairs are skipped by the v2 unique key.
+  /// Removes a semester snapshot from the active roster without erasing the
+  /// long-term profile, attendance records, or event history.
+  void deactivateMember(int memberId) {
+    _ensureOpen();
+    _database.execute('UPDATE members SET active = 0 WHERE id = ?', [memberId]);
+    _requireChangedRow('Member', memberId);
+  }
+
+  /// Copies roster snapshots into another semester while retaining the same
+  /// long-term person IDs. Existing people in the destination are left intact.
   int copyMemberRoster({
     required int fromSemesterId,
     required int toSemesterId,
@@ -672,8 +1173,10 @@ class LionRepository {
       _database.execute(
         '''
         INSERT OR IGNORE INTO members
-          (semester_id, student_no, name, grade, major, position, birthday, notes, active)
-        SELECT ?, student_no, name, grade, major, position, birthday, notes, active
+          (semester_id, person_id, student_no, name, grade, major, position,
+           birthday, contact, notes, active)
+        SELECT ?, person_id, student_no, name, grade, major, position,
+               birthday, contact, notes, active
         FROM members WHERE semester_id = ?
       ''',
         [toSemesterId, fromSemesterId],
@@ -837,7 +1340,96 @@ class LionRepository {
     );
   }
 
-  List<EventModel> getEvents({String? fromDate, String? throughDate}) {
+  List<RecurringActivityModel> getRecurringActivities({
+    String? activityType,
+    bool activeOnly = false,
+  }) {
+    _ensureOpen();
+    final clauses = <String>[];
+    final values = <Object?>[];
+    if (activityType != null) {
+      clauses.add('activity_type = ?');
+      values.add(activityType);
+    }
+    if (activeOnly) clauses.add('active = 1');
+    final whereClause = clauses.isEmpty ? '' : 'WHERE ${clauses.join(' AND ')}';
+    return _select('''
+      SELECT id, title, activity_type, description, active, created_at, updated_at
+      FROM recurring_activities $whereClause
+      ORDER BY activity_type, title, id
+    ''', values).map(RecurringActivityModel.fromMap).toList(growable: false);
+  }
+
+  RecurringActivityModel? getRecurringActivity(int activityId) {
+    _ensureOpen();
+    final rows = _select(
+      '''
+      SELECT id, title, activity_type, description, active, created_at, updated_at
+      FROM recurring_activities WHERE id = ?
+    ''',
+      [activityId],
+    );
+    return rows.isEmpty ? null : RecurringActivityModel.fromMap(rows.first);
+  }
+
+  int addRecurringActivity({
+    required String title,
+    required String activityType,
+    String description = '',
+    bool active = true,
+  }) {
+    _ensureOpen();
+    final now = _now();
+    _database.execute(
+      '''INSERT INTO recurring_activities
+         (title, activity_type, description, active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)''',
+      [
+        title.trim(),
+        _normalizeActivityType(activityType),
+        description,
+        active ? 1 : 0,
+        now,
+        now,
+      ],
+    );
+    return _database.lastInsertRowId;
+  }
+
+  void updateRecurringActivity(RecurringActivityModel activity) {
+    _ensureOpen();
+    _database.execute(
+      '''UPDATE recurring_activities
+         SET title = ?, activity_type = ?, description = ?, active = ?, updated_at = ?
+         WHERE id = ?''',
+      [
+        activity.title.trim(),
+        _normalizeActivityType(activity.activityType),
+        activity.description,
+        activity.active ? 1 : 0,
+        _now(),
+        activity.id,
+      ],
+    );
+    _requireChangedRow('Recurring activity', activity.id);
+  }
+
+  void deleteRecurringActivity(int activityId) {
+    _ensureOpen();
+    _database.execute('DELETE FROM recurring_activities WHERE id = ?', [
+      activityId,
+    ]);
+  }
+
+  static String _normalizeActivityType(String value) =>
+      value.trim().isEmpty ? 'other' : value.trim();
+
+  List<EventModel> getEvents({
+    String? fromDate,
+    String? throughDate,
+    int? semesterId,
+    String? eventType,
+  }) {
     _ensureOpen();
     final clauses = <String>[];
     final values = <Object?>[];
@@ -849,11 +1441,37 @@ class LionRepository {
       clauses.add('event_date <= ?');
       values.add(throughDate);
     }
+    if (semesterId != null) {
+      clauses.add('semester_id = ?');
+      values.add(semesterId);
+    }
+    if (eventType != null) {
+      clauses.add('event_type = ?');
+      values.add(eventType);
+    }
     final whereClause = clauses.isEmpty ? '' : 'WHERE ${clauses.join(' AND ')}';
     return _select('''
-      SELECT id, title, event_date, location, summary, created_at, updated_at
+      SELECT id, title, event_date, location, summary, semester_id,
+             recurring_activity_id, event_type, created_at, updated_at
       FROM events $whereClause ORDER BY event_date DESC, id DESC
     ''', values).map(EventModel.fromMap).toList(growable: false);
+  }
+
+  /// Groups events by their stored semester (null means legacy/unknown) and
+  /// event type, preserving distinct event records and their order.
+  Map<int?, Map<String, List<EventModel>>> getEventsGroupedBySemesterAndType() {
+    final grouped = <int?, Map<String, List<EventModel>>>{};
+    for (final event in getEvents()) {
+      final semesterGroup = grouped.putIfAbsent(
+        event.semesterId,
+        () => <String, List<EventModel>>{},
+      );
+      final type = event.eventType?.trim().isNotEmpty == true
+          ? event.eventType!.trim()
+          : 'other';
+      semesterGroup.putIfAbsent(type, () => <EventModel>[]).add(event);
+    }
+    return grouped;
   }
 
   /// Returns distinct events attended by any of the supplied semester rows.
@@ -865,6 +1483,7 @@ class LionRepository {
     return _select(
       '''
       SELECT DISTINCT e.id, e.title, e.event_date, e.location, e.summary,
+             e.semester_id, e.recurring_activity_id, e.event_type,
              e.created_at, e.updated_at
       FROM events AS e
       JOIN event_members AS em ON em.event_id = e.id
@@ -879,7 +1498,8 @@ class LionRepository {
     _ensureOpen();
     final rows = _select(
       '''
-      SELECT id, title, event_date, location, summary, created_at, updated_at
+      SELECT id, title, event_date, location, summary, semester_id,
+             recurring_activity_id, event_type, created_at, updated_at
       FROM events WHERE id = ?
     ''',
       [eventId],
@@ -892,34 +1512,111 @@ class LionRepository {
     String eventDate = '',
     String location = '',
     String summary = '',
+    int? semesterId,
+    int? recurringActivityId,
+    String? eventType,
   }) {
     _ensureOpen();
     final now = _now();
+    final resolvedEventType = eventType?.trim().isNotEmpty == true
+        ? eventType!.trim()
+        : _activityTypeFor(recurringActivityId) ?? 'other';
     _database.execute(
       '''INSERT INTO events
-         (title, event_date, location, summary, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)''',
-      [title, eventDate, location, summary, now, now],
+         (title, event_date, location, summary, semester_id,
+          recurring_activity_id, event_type, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+      [
+        title,
+        eventDate,
+        location,
+        summary,
+        semesterId,
+        recurringActivityId,
+        resolvedEventType,
+        now,
+        now,
+      ],
     );
     return _database.lastInsertRowId;
   }
 
   void updateEvent(EventModel event) {
     _ensureOpen();
+    final resolvedEventType =
+        event.eventType ??
+        (event.recurringActivityId == null
+            ? null
+            : _activityTypeFor(event.recurringActivityId));
     _database.execute(
       '''UPDATE events
-         SET title = ?, event_date = ?, location = ?, summary = ?, updated_at = ?
+         SET title = ?, event_date = ?, location = ?, summary = ?,
+             semester_id = COALESCE(?, semester_id),
+             recurring_activity_id = COALESCE(?, recurring_activity_id),
+             event_type = COALESCE(?, event_type), updated_at = ?
          WHERE id = ?''',
       [
         event.title,
         event.eventDate,
         event.location,
         event.summary,
+        event.semesterId,
+        event.recurringActivityId,
+        resolvedEventType,
         _now(),
         event.id,
       ],
     );
     _requireChangedRow('Event', event.id);
+  }
+
+  /// Explicitly sets or clears an event's semester and recurring-activity
+  /// classification. A null semester keeps the term unknown/unassigned.
+  void updateEventClassification({
+    required int eventId,
+    int? semesterId,
+    int? recurringActivityId,
+    String? eventType,
+  }) {
+    _ensureOpen();
+    final resolvedEventType = eventType == null
+        ? _activityTypeFor(recurringActivityId) ?? 'other'
+        : _normalizeActivityType(eventType);
+    _database.execute(
+      '''UPDATE events
+         SET semester_id = ?, recurring_activity_id = ?, event_type = ?,
+             updated_at = ? WHERE id = ?''',
+      [semesterId, recurringActivityId, resolvedEventType, _now(), eventId],
+    );
+    _requireChangedRow('Event', eventId);
+  }
+
+  void linkEventToRecurringActivity({
+    required int eventId,
+    required int? recurringActivityId,
+  }) {
+    _ensureOpen();
+    final activityType = _activityTypeFor(recurringActivityId);
+    _database.execute(
+      '''UPDATE events
+         SET recurring_activity_id = ?,
+             event_type = COALESCE(?, event_type), updated_at = ?
+         WHERE id = ?''',
+      [recurringActivityId, activityType, _now(), eventId],
+    );
+    _requireChangedRow('Event', eventId);
+  }
+
+  String? _activityTypeFor(int? recurringActivityId) {
+    if (recurringActivityId == null) return null;
+    final rows = _database.select(
+      'SELECT activity_type FROM recurring_activities WHERE id = ?',
+      [recurringActivityId],
+    );
+    if (rows.isEmpty) {
+      throw ArgumentError.value(recurringActivityId, 'recurringActivityId');
+    }
+    return rows.first['activity_type']?.toString();
   }
 
   void deleteEvent(int eventId) {
@@ -931,8 +1628,8 @@ class LionRepository {
     _ensureOpen();
     return _select(
       '''
-      SELECT m.id, m.semester_id, m.student_no, m.name, m.grade, m.major, m.position,
-             m.birthday, m.notes, m.active
+      SELECT m.id, m.person_id, m.semester_id, m.student_no, m.name, m.grade,
+             m.major, m.position, m.birthday, m.contact, m.notes, m.active
       FROM event_members AS em
       JOIN members AS m ON m.id = em.member_id
       WHERE em.event_id = ? ORDER BY m.name, m.id
@@ -973,6 +1670,365 @@ class LionRepository {
       }
     });
   }
+
+  List<InventoryItemModel> getInventoryItems({String? search}) {
+    _ensureOpen();
+    final term = search?.trim() ?? '';
+    final rows = term.isEmpty
+        ? _select('''
+            SELECT id, name, category, unit, current_quantity, location,
+                   condition, notes,
+                   created_at, updated_at
+            FROM inventory_items ORDER BY name, id
+          ''')
+        : _select(
+            '''
+            SELECT id, name, category, unit, current_quantity, location,
+                   condition, notes,
+                   created_at, updated_at
+            FROM inventory_items
+            WHERE name LIKE ? OR category LIKE ? OR unit LIKE ?
+               OR location LIKE ? OR notes LIKE ?
+            ORDER BY name, id
+          ''',
+            ['%$term%', '%$term%', '%$term%', '%$term%', '%$term%'],
+          );
+    return rows.map(InventoryItemModel.fromMap).toList(growable: false);
+  }
+
+  InventoryItemModel? getInventoryItem(int itemId) {
+    _ensureOpen();
+    final rows = _select(
+      '''
+      SELECT id, name, category, unit, current_quantity, location, condition,
+             notes,
+             created_at, updated_at
+      FROM inventory_items WHERE id = ?
+    ''',
+      [itemId],
+    );
+    return rows.isEmpty ? null : InventoryItemModel.fromMap(rows.first);
+  }
+
+  int addInventoryItem({
+    required String name,
+    String category = '',
+    String unit = '',
+    int currentQuantity = 0,
+    String location = '',
+    String condition = '',
+    String notes = '',
+  }) {
+    _ensureOpen();
+    _validateInventoryCount(currentQuantity);
+    final now = _now();
+    return _transaction(() {
+      _database.execute(
+        '''INSERT INTO inventory_items
+           (name, category, unit, current_quantity, location, condition,
+            notes, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        [
+          name.trim(),
+          category,
+          unit,
+          currentQuantity,
+          location,
+          condition,
+          notes,
+          now,
+          now,
+        ],
+      );
+      final itemId = _database.lastInsertRowId;
+      if (currentQuantity > 0) {
+        _insertInventoryMovement(
+          itemId: itemId,
+          movementType: InventoryMovementType.adjustment,
+          quantityDelta: currentQuantity,
+          movementDate: _today(),
+          notes: 'Initial count',
+          createdAt: now,
+        );
+      }
+      return itemId;
+    });
+  }
+
+  /// Updates item details and records a signed adjustment when the current
+  /// quantity changes. The explicit adjustment note can be used for audits.
+  void updateInventoryItem(
+    InventoryItemModel item, {
+    String adjustmentNotes = 'Manual count adjustment',
+  }) {
+    _ensureOpen();
+    _validateInventoryCount(item.currentQuantity);
+    _transaction(() {
+      final rows = _database.select(
+        'SELECT current_quantity FROM inventory_items WHERE id = ?',
+        [item.id],
+      );
+      if (rows.isEmpty) {
+        throw ArgumentError('Inventory item ${item.id} does not exist.');
+      }
+      final oldQuantity = (rows.first['current_quantity'] as num).toInt();
+      final delta = item.currentQuantity - oldQuantity;
+      _database.execute(
+        '''UPDATE inventory_items
+           SET name = ?, category = ?, unit = ?, current_quantity = ?,
+               location = ?, condition = ?, notes = ?, updated_at = ?
+           WHERE id = ?''',
+        [
+          item.name.trim(),
+          item.category,
+          item.unit,
+          item.currentQuantity,
+          item.location,
+          item.condition,
+          item.notes,
+          _now(),
+          item.id,
+        ],
+      );
+      _requireChangedRow('Inventory item', item.id);
+      if (delta != 0) {
+        _insertInventoryMovement(
+          itemId: item.id,
+          movementType: InventoryMovementType.adjustment,
+          quantityDelta: delta,
+          movementDate: _today(),
+          notes: adjustmentNotes,
+          createdAt: _now(),
+        );
+      }
+    });
+  }
+
+  void deleteInventoryItem(int itemId) {
+    _ensureOpen();
+    _database.execute('DELETE FROM inventory_items WHERE id = ?', [itemId]);
+  }
+
+  List<InventoryMovementModel> getInventoryMovements({
+    int? itemId,
+    String? fromDate,
+    String? throughDate,
+  }) {
+    _ensureOpen();
+    final clauses = <String>[];
+    final values = <Object?>[];
+    if (itemId != null) {
+      clauses.add('item_id = ?');
+      values.add(itemId);
+    }
+    if (fromDate != null) {
+      clauses.add('movement_date >= ?');
+      values.add(fromDate);
+    }
+    if (throughDate != null) {
+      clauses.add('movement_date <= ?');
+      values.add(throughDate);
+    }
+    final whereClause = clauses.isEmpty ? '' : 'WHERE ${clauses.join(' AND ')}';
+    return _select('''
+      SELECT id, item_id, movement_type, quantity_delta, movement_date,
+             notes, created_at
+      FROM inventory_movements $whereClause
+      ORDER BY movement_date DESC, id DESC
+    ''', values).map(InventoryMovementModel.fromMap).toList(growable: false);
+  }
+
+  int addInventoryMovement({
+    required int itemId,
+    required InventoryMovementType movementType,
+    required int quantity,
+    String? movementDate,
+    String notes = '',
+  }) {
+    _ensureOpen();
+    final delta = _inventoryQuantityDelta(movementType, quantity);
+    return _transaction(() {
+      final current = _currentInventoryCount(itemId);
+      final next = current + delta;
+      _validateInventoryCount(next);
+      final now = _now();
+      _database.execute(
+        'UPDATE inventory_items SET current_quantity = ?, updated_at = ? WHERE id = ?',
+        [next, now, itemId],
+      );
+      _requireChangedRow('Inventory item', itemId);
+      _insertInventoryMovement(
+        itemId: itemId,
+        movementType: movementType,
+        quantityDelta: delta,
+        movementDate: movementDate ?? _today(),
+        notes: notes,
+        createdAt: now,
+      );
+      return _database.lastInsertRowId;
+    });
+  }
+
+  void updateInventoryMovement(InventoryMovementModel movement) {
+    _ensureOpen();
+    _validateStoredInventoryDelta(
+      movement.movementType,
+      movement.quantityDelta,
+    );
+    _transaction(() {
+      final rows = _database.select(
+        'SELECT item_id, movement_type, quantity_delta FROM inventory_movements WHERE id = ?',
+        [movement.id],
+      );
+      if (rows.isEmpty) {
+        throw ArgumentError(
+          'Inventory movement ${movement.id} does not exist.',
+        );
+      }
+      final oldItemId = (rows.first['item_id'] as num).toInt();
+      final oldDelta = (rows.first['quantity_delta'] as num).toInt();
+      if (oldItemId == movement.itemId) {
+        final next =
+            _currentInventoryCount(oldItemId) -
+            oldDelta +
+            movement.quantityDelta;
+        _validateInventoryCount(next);
+        _database.execute(
+          'UPDATE inventory_items SET current_quantity = ?, updated_at = ? WHERE id = ?',
+          [next, _now(), oldItemId],
+        );
+      } else {
+        final oldNext = _currentInventoryCount(oldItemId) - oldDelta;
+        final newNext =
+            _currentInventoryCount(movement.itemId) + movement.quantityDelta;
+        _validateInventoryCount(oldNext);
+        _validateInventoryCount(newNext);
+        _database.execute(
+          'UPDATE inventory_items SET current_quantity = ?, updated_at = ? WHERE id = ?',
+          [oldNext, _now(), oldItemId],
+        );
+        _database.execute(
+          'UPDATE inventory_items SET current_quantity = ?, updated_at = ? WHERE id = ?',
+          [newNext, _now(), movement.itemId],
+        );
+        _requireChangedRow('Inventory item', movement.itemId);
+      }
+      _database.execute(
+        '''UPDATE inventory_movements
+           SET item_id = ?, movement_type = ?, quantity_delta = ?,
+               movement_date = ?, notes = ? WHERE id = ?''',
+        [
+          movement.itemId,
+          movement.movementType.sqliteValue,
+          movement.quantityDelta,
+          movement.movementDate,
+          movement.notes,
+          movement.id,
+        ],
+      );
+    });
+  }
+
+  void deleteInventoryMovement(int movementId) {
+    _ensureOpen();
+    _transaction(() {
+      final rows = _database.select(
+        'SELECT item_id, quantity_delta FROM inventory_movements WHERE id = ?',
+        [movementId],
+      );
+      if (rows.isEmpty) return;
+      final itemId = (rows.first['item_id'] as num).toInt();
+      final delta = (rows.first['quantity_delta'] as num).toInt();
+      final next = _currentInventoryCount(itemId) - delta;
+      _validateInventoryCount(next);
+      _database.execute(
+        'UPDATE inventory_items SET current_quantity = ?, updated_at = ? WHERE id = ?',
+        [next, _now(), itemId],
+      );
+      _database.execute('DELETE FROM inventory_movements WHERE id = ?', [
+        movementId,
+      ]);
+    });
+  }
+
+  int _currentInventoryCount(int itemId) {
+    final rows = _database.select(
+      'SELECT current_quantity FROM inventory_items WHERE id = ?',
+      [itemId],
+    );
+    if (rows.isEmpty) {
+      throw ArgumentError('Inventory item $itemId does not exist.');
+    }
+    return (rows.first['current_quantity'] as num).toInt();
+  }
+
+  void _insertInventoryMovement({
+    required int itemId,
+    required InventoryMovementType movementType,
+    required int quantityDelta,
+    required String movementDate,
+    required String notes,
+    required String createdAt,
+  }) {
+    _validateStoredInventoryDelta(movementType, quantityDelta);
+    _database.execute(
+      '''INSERT INTO inventory_movements
+         (item_id, movement_type, quantity_delta, movement_date, notes, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)''',
+      [
+        itemId,
+        movementType.sqliteValue,
+        quantityDelta,
+        movementDate,
+        notes,
+        createdAt,
+      ],
+    );
+  }
+
+  static int _inventoryQuantityDelta(
+    InventoryMovementType movementType,
+    int quantity,
+  ) {
+    if (movementType == InventoryMovementType.adjustment) {
+      if (quantity == 0) {
+        throw ArgumentError.value(quantity, 'quantity', 'Must not be zero.');
+      }
+      return quantity;
+    }
+    if (quantity <= 0) {
+      throw ArgumentError.value(quantity, 'quantity', 'Must be positive.');
+    }
+    return movementType.isOutbound ? -quantity : quantity;
+  }
+
+  static void _validateStoredInventoryDelta(
+    InventoryMovementType movementType,
+    int quantityDelta,
+  ) {
+    if (quantityDelta == 0 ||
+        (movementType.isInbound && quantityDelta < 0) ||
+        (movementType.isOutbound && quantityDelta > 0)) {
+      throw ArgumentError.value(
+        quantityDelta,
+        'quantityDelta',
+        'Quantity sign must match the movement type and cannot be zero.',
+      );
+    }
+  }
+
+  static void _validateInventoryCount(int value) {
+    if (value < 0) {
+      throw ArgumentError.value(
+        value,
+        'currentQuantity',
+        'Must be nonnegative.',
+      );
+    }
+  }
+
+  static String _today() =>
+      DateTime.now().toUtc().toIso8601String().substring(0, 10);
 
   List<RoutineModel> getRoutines() {
     _ensureOpen();

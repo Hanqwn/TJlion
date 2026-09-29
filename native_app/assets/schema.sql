@@ -8,19 +8,42 @@ CREATE TABLE IF NOT EXISTS semesters (
   is_current INTEGER NOT NULL DEFAULT 0 CHECK (is_current IN (0, 1))
 );
 
+CREATE TABLE IF NOT EXISTS member_profiles (
+  id INTEGER PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  birthday TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS member_profile_student_ids (
+  normalized_student_no TEXT PRIMARY KEY,
+  profile_id INTEGER NOT NULL REFERENCES member_profiles(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS members (
   id INTEGER PRIMARY KEY,
   semester_id INTEGER NOT NULL REFERENCES semesters(id) ON DELETE CASCADE,
+  person_id INTEGER NOT NULL REFERENCES member_profiles(id),
   student_no TEXT NOT NULL DEFAULT '',
   name TEXT NOT NULL,
   grade TEXT NOT NULL DEFAULT '',
   major TEXT NOT NULL DEFAULT '',
   position TEXT NOT NULL DEFAULT '',
   birthday TEXT NOT NULL DEFAULT '',
+  contact TEXT NOT NULL DEFAULT '',
   notes TEXT NOT NULL DEFAULT '',
   active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
   UNIQUE (semester_id, student_no, name)
 );
+
+CREATE INDEX IF NOT EXISTS idx_members_semester_person
+  ON members(semester_id, person_id);
+CREATE INDEX IF NOT EXISTS idx_members_person
+  ON members(person_id);
+CREATE INDEX IF NOT EXISTS idx_member_profile_student_ids_profile
+  ON member_profile_student_ids(profile_id);
 
 CREATE TABLE IF NOT EXISTS attendance_sessions (
   id INTEGER PRIMARY KEY,
@@ -53,12 +76,25 @@ CREATE TABLE IF NOT EXISTS routines (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS recurring_activities (
+  id INTEGER PRIMARY KEY,
+  title TEXT NOT NULL,
+  activity_type TEXT NOT NULL DEFAULT 'other',
+  description TEXT NOT NULL DEFAULT '',
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY,
   title TEXT NOT NULL,
   event_date TEXT NOT NULL DEFAULT '',
   location TEXT NOT NULL DEFAULT '',
   summary TEXT NOT NULL DEFAULT '',
+  semester_id INTEGER REFERENCES semesters(id) ON DELETE SET NULL,
+  recurring_activity_id INTEGER REFERENCES recurring_activities(id) ON DELETE SET NULL,
+  event_type TEXT NOT NULL DEFAULT 'other',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -67,6 +103,36 @@ CREATE TABLE IF NOT EXISTS event_members (
   event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
   member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
   PRIMARY KEY (event_id, member_id)
+);
+
+CREATE TABLE IF NOT EXISTS inventory_items (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT '',
+  unit TEXT NOT NULL DEFAULT '',
+  current_quantity INTEGER NOT NULL DEFAULT 0 CHECK (current_quantity >= 0),
+  location TEXT NOT NULL DEFAULT '',
+  condition TEXT NOT NULL DEFAULT '',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inventory_movements (
+  id INTEGER PRIMARY KEY,
+  item_id INTEGER NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+  movement_type TEXT NOT NULL CHECK (
+    movement_type IN ('received', 'purchased', 'found', 'lost', 'stolen', 'disposed', 'adjustment')
+  ),
+  quantity_delta INTEGER NOT NULL CHECK (quantity_delta <> 0),
+  CHECK (
+    (movement_type IN ('received', 'purchased', 'found') AND quantity_delta > 0) OR
+    (movement_type IN ('lost', 'stolen', 'disposed') AND quantity_delta < 0) OR
+    movement_type = 'adjustment'
+  ),
+  movement_date TEXT NOT NULL,
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -115,6 +181,12 @@ CREATE TABLE IF NOT EXISTS media_assets (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS media_file_paths (
+  media_key TEXT PRIMARY KEY,
+  relative_path TEXT NOT NULL UNIQUE,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS legacy_assets (
   id INTEGER PRIMARY KEY,
   media_key TEXT NOT NULL UNIQUE,
@@ -144,8 +216,14 @@ CREATE TABLE IF NOT EXISTS event_legacy_assets (
 CREATE INDEX IF NOT EXISTS idx_members_semester ON members(semester_id, name);
 CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_sessions(session_date DESC);
 CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date DESC);
+CREATE INDEX IF NOT EXISTS idx_events_semester_type
+  ON events(semester_id, event_type, event_date DESC);
+CREATE INDEX IF NOT EXISTS idx_events_recurring_activity
+  ON events(recurring_activity_id, event_date DESC);
+CREATE INDEX IF NOT EXISTS idx_inventory_movements_item_date
+  ON inventory_movements(item_id, movement_date DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_finance_date ON finance_entries(transaction_date DESC);
 CREATE INDEX IF NOT EXISTS idx_legacy_category ON legacy_assets(category, group_name, title);
 CREATE INDEX IF NOT EXISTS idx_media_owner ON media_assets(owner_type, owner_id);
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 5;

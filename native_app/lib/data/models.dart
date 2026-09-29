@@ -88,9 +88,35 @@ class Semester {
   );
 }
 
+/// A stable identity shared by one person's semester-specific roster records.
+class PersonProfile {
+  const PersonProfile({
+    required this.id,
+    required this.displayName,
+    required this.birthday,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final int id;
+  final String displayName;
+  final String birthday;
+  final String createdAt;
+  final String updatedAt;
+
+  factory PersonProfile.fromMap(Map<String, Object?> row) => PersonProfile(
+    id: _intValue(row, 'id'),
+    displayName: _stringValue(row, 'display_name'),
+    birthday: _stringValue(row, 'birthday'),
+    createdAt: _stringValue(row, 'created_at'),
+    updatedAt: _stringValue(row, 'updated_at'),
+  );
+}
+
 class Member {
   const Member({
     required this.id,
+    required this.personId,
     required this.semesterId,
     required this.studentNo,
     required this.name,
@@ -98,11 +124,13 @@ class Member {
     required this.major,
     required this.position,
     required this.birthday,
+    this.contact,
     required this.notes,
     required this.active,
   });
 
   final int id;
+  final int personId;
   final int semesterId;
   final String studentNo;
   final String name;
@@ -110,11 +138,13 @@ class Member {
   final String major;
   final String position;
   final String birthday;
+  final String? contact;
   final String notes;
   final bool active;
 
   factory Member.fromMap(Map<String, Object?> row) => Member(
     id: _intValue(row, 'id'),
+    personId: _intValue(row, 'person_id'),
     semesterId: _intValue(row, 'semester_id'),
     studentNo: _stringValue(row, 'student_no'),
     name: _stringValue(row, 'name'),
@@ -122,6 +152,7 @@ class Member {
     major: _stringValue(row, 'major'),
     position: _stringValue(row, 'position'),
     birthday: _stringValue(row, 'birthday'),
+    contact: _stringValue(row, 'contact'),
     notes: _stringValue(row, 'notes'),
     active: _boolValue(row, 'active'),
   );
@@ -199,6 +230,9 @@ class EventModel {
     required this.eventDate,
     required this.location,
     required this.summary,
+    this.semesterId,
+    this.recurringActivityId,
+    this.eventType,
     required this.createdAt,
     required this.updatedAt,
   });
@@ -208,6 +242,9 @@ class EventModel {
   final String eventDate;
   final String location;
   final String summary;
+  final int? semesterId;
+  final int? recurringActivityId;
+  final String? eventType;
   final String createdAt;
   final String updatedAt;
 
@@ -217,9 +254,145 @@ class EventModel {
     eventDate: _stringValue(row, 'event_date'),
     location: _stringValue(row, 'location'),
     summary: _stringValue(row, 'summary'),
+    semesterId: row['semester_id'] == null
+        ? null
+        : _intValue(row, 'semester_id'),
+    recurringActivityId: row['recurring_activity_id'] == null
+        ? null
+        : _intValue(row, 'recurring_activity_id'),
+    eventType: _nullableStringValue(row, 'event_type'),
     createdAt: _stringValue(row, 'created_at'),
     updatedAt: _stringValue(row, 'updated_at'),
   );
+}
+
+class RecurringActivityModel {
+  const RecurringActivityModel({
+    required this.id,
+    required this.title,
+    required this.activityType,
+    required this.description,
+    required this.active,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final int id;
+  final String title;
+  final String activityType;
+  final String description;
+  final bool active;
+  final String createdAt;
+  final String updatedAt;
+
+  factory RecurringActivityModel.fromMap(Map<String, Object?> row) =>
+      RecurringActivityModel(
+        id: _intValue(row, 'id'),
+        title: _stringValue(row, 'title'),
+        activityType: _stringValue(row, 'activity_type'),
+        description: _stringValue(row, 'description'),
+        active: _boolValue(row, 'active'),
+        createdAt: _stringValue(row, 'created_at'),
+        updatedAt: _stringValue(row, 'updated_at'),
+      );
+}
+
+enum InventoryMovementType {
+  received('received'),
+  purchased('purchased'),
+  found('found'),
+  lost('lost'),
+  stolen('stolen'),
+  disposed('disposed'),
+  adjustment('adjustment');
+
+  const InventoryMovementType(this.sqliteValue);
+
+  final String sqliteValue;
+
+  bool get isInbound => this == received || this == purchased || this == found;
+
+  bool get isOutbound => this == lost || this == stolen || this == disposed;
+
+  static InventoryMovementType fromSqlite(Object? value) =>
+      InventoryMovementType.values.firstWhere(
+        (type) => type.sqliteValue == value,
+        orElse: () =>
+            throw FormatException('Unknown inventory movement type: $value'),
+      );
+}
+
+class InventoryItemModel {
+  const InventoryItemModel({
+    required this.id,
+    required this.name,
+    this.category = '',
+    this.unit = '',
+    required this.currentQuantity,
+    required this.location,
+    required this.condition,
+    required this.notes,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final int id;
+  final String name;
+  final String category;
+  final String unit;
+  final int currentQuantity;
+  final String location;
+  final String condition;
+  final String notes;
+  final String createdAt;
+  final String updatedAt;
+
+  factory InventoryItemModel.fromMap(Map<String, Object?> row) =>
+      InventoryItemModel(
+        id: _intValue(row, 'id'),
+        name: _stringValue(row, 'name'),
+        category: _stringValue(row, 'category'),
+        unit: _stringValue(row, 'unit'),
+        currentQuantity: _intValue(row, 'current_quantity'),
+        location: _stringValue(row, 'location'),
+        condition: _stringValue(row, 'condition'),
+        notes: _stringValue(row, 'notes'),
+        createdAt: _stringValue(row, 'created_at'),
+        updatedAt: _stringValue(row, 'updated_at'),
+      );
+}
+
+class InventoryMovementModel {
+  const InventoryMovementModel({
+    required this.id,
+    required this.itemId,
+    required this.movementType,
+    required this.quantityDelta,
+    required this.movementDate,
+    required this.notes,
+    required this.createdAt,
+  });
+
+  final int id;
+  final int itemId;
+  final InventoryMovementType movementType;
+
+  /// Positive means inventory increased; negative means it decreased.
+  final int quantityDelta;
+  final String movementDate;
+  final String notes;
+  final String createdAt;
+
+  factory InventoryMovementModel.fromMap(Map<String, Object?> row) =>
+      InventoryMovementModel(
+        id: _intValue(row, 'id'),
+        itemId: _intValue(row, 'item_id'),
+        movementType: InventoryMovementType.fromSqlite(row['movement_type']),
+        quantityDelta: _intValue(row, 'quantity_delta'),
+        movementDate: _stringValue(row, 'movement_date'),
+        notes: _stringValue(row, 'notes'),
+        createdAt: _stringValue(row, 'created_at'),
+      );
 }
 
 class RoutineModel {
