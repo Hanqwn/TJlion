@@ -1,10 +1,15 @@
 # Team and member records must stay local and must never enter repository history.
 /archive/
 /notices/
-/data/seed.sqlite3
-/data/migration/legacy-manifest.json
+/data/
 **/legacy_assets/
-/data/transfer-inbox/
+
+# Local operating instructions and legacy PWA utilities.
+/AGENTS.md
+/requirements*.txt
+/scripts/build_seed_db.py
+/scripts/organize_archive.py
+/native_app/test/widget_test.dart
 
 # Locally downloaded dependencies and generated release artifacts.
 /.deps/
