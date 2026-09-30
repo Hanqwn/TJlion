@@ -125,14 +125,14 @@ CREATE TABLE IF NOT EXISTS inventory_movements (
     movement_type IN ('received', 'purchased', 'found', 'lost', 'stolen', 'disposed', 'adjustment')
   ),
   quantity_delta INTEGER NOT NULL CHECK (quantity_delta <> 0),
+  movement_date TEXT NOT NULL,
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
   CHECK (
     (movement_type IN ('received', 'purchased', 'found') AND quantity_delta > 0) OR
     (movement_type IN ('lost', 'stolen', 'disposed') AND quantity_delta < 0) OR
     movement_type = 'adjustment'
-  ),
-  movement_date TEXT NOT NULL,
-  notes TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL
+  )
 );
 
 CREATE TABLE IF NOT EXISTS documents (
